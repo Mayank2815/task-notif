@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: task-notif
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Free instances sleep after 15 minutes idle. The scheduler must be awake at
+    # 09:00 with nobody making requests, so a paid always-on plan is required.
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      # config, run history and the threads marked Done — wiped on redeploy without this
+      name: task-notif-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /app/data
+      - key: TZ
+        value: UTC
+      # Set these in the Render dashboard, never in this file.
+      - key: TEAMWORK_SITE_URL
+        sync: false
+      - key: TEAMWORK_API_TOKEN
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: SLACK_USER_TOKEN_ALICE
+        sync: false
+      - key: SLACK_USER_TOKEN_BOB
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # Required here: on Render the dashboard URL is public.
+      - key: DASHBOARD_PASSWORD
+        generateValue: true

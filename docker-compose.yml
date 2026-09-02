@@ -1,0 +1,17 @@
+services:
+  task-notif:
+    build: .
+    image: task-notif:latest
+    container_name: task-notif
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Luxon computes the reminder times from the configured timezone, so the
+      # container clock only needs to be correct, not local.
+      TZ: UTC
+    volumes:
+      - ./data:/app/data
+    ports:
+      # Bound to loopback on purpose: the dashboard has no authentication, so it
+      # must not be reachable from the internet. Use an SSH tunnel to open it.
+      - "127.0.0.1:4310:4310"
