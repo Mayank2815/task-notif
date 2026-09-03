@@ -94,11 +94,14 @@ export function renderReminder(
   timezone: string,
   slackAwaiting: SlackMention[] = [],
   note?: string,
+  yesterdaySummary: string | null = null,
 ): RenderedMessage {
   const name = result.recipient.label || result.identity.displayName;
-  const today = DateTime.now().setZone(timezone).toFormat('cccc, d LLLL');
+  const now = DateTime.now().setZone(timezone);
+  const today = now.toFormat('cccc, d LLLL');
+  const yesterdayLabel = now.minus({ days: 1 }).toFormat('cccc, d LLLL');
 
-  if (result.total === 0 && slackAwaiting.length === 0) {
+  if (result.total === 0 && slackAwaiting.length === 0 && !yesterdaySummary) {
     return {
       text: `Nothing pending — ${today}`,
       blocks: [
@@ -116,19 +119,29 @@ export function renderReminder(
   ].filter(Boolean).join('   ');
 
   const intro: unknown[] = [
-    { type: 'header', text: { type: 'plain_text', text: `${totalItems} need${totalItems === 1 ? 's' : ''} you today`, emoji: true } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)} · ${esc(name)}${note ? `  ·  ${esc(note)}` : ''}` }] },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: tally }] },
+    { type: 'header', text: { type: 'plain_text', text: `Good morning, ${name.split(' ')[0]}`, emoji: true } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)}${note ? `  ·  ${esc(note)}` : ''}` }] },
   ];
+
+  // Yesterday first: it is the half you read out, and stand-up comes before the day's work.
+  if (yesterdaySummary) {
+    intro.push(sectionHeading(`🗣️ Yesterday — ${yesterdayLabel}`));
+    intro.push({ type: 'section', text: { type: 'mrkdwn', text: yesterdaySummary } });
+    intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_for stand-up_' }] });
+  }
+
+  intro.push({ type: 'divider' });
+  intro.push(sectionHeading(`📋 Needs you today · ${totalItems}`));
+  intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: tally }] });
 
   const sections: BlockSection[] = result.groups.map((group) => ({
     // Top level, not inside an attachment: Slack only renders a header block large
     // at the top level, which is what makes a heading read as a heading.
     header: [
-      { type: 'divider' },
-      sectionHeading(`${groupEmoji(group.ruleId)} ${group.label} · ${group.items.length}`),
+      { type: 'section', text: { type: 'mrkdwn', text: `${groupEmoji(group.ruleId)}  *${esc(group.label)}*  ·  ${group.items.length}` } },
     ],
-    items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map((item, index) => taskRow(item, group.ruleId, index + 1)),
+    items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map((item, index) =>
+      taskRow(item, group.ruleId, index + 1, result.recipient.id)),
     more: (hidden: number) => ({
       type: 'context',
       elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, group.items.length - MAX_ITEMS_PER_GROUP)} more_` }],
@@ -138,8 +151,7 @@ export function renderReminder(
   if (slackAwaiting.length > 0) {
     sections.push({
       header: [
-        { type: 'divider' },
-        sectionHeading(`💬 Slack — still unanswered · ${slackAwaiting.length}`),
+        { type: 'section', text: { type: 'mrkdwn', text: `💬  *Slack — still unanswered*  ·  ${slackAwaiting.length}` } },
       ],
       items: slackAwaiting.slice(0, MAX_SLACK_ROWS).map((m) => slackRow(m, result.recipient.id)),
       more: (hidden: number) => ({
@@ -157,9 +169,18 @@ function taskRow(
   item: RecipientResult['groups'][number]['items'][number],
   ruleId: string,
   position: number,
+  recipientId: string,
 ): unknown[] {
   const { task, match, assigneeNames } = item;
   const title = link(match.link, cleanTaskName(task.name));
+
+  // An accessory costs no extra block, so every row can carry a dismiss button.
+  const doneButton = {
+    type: 'button',
+    action_id: 'dismiss_task',
+    text: { type: 'plain_text', text: '✅ Done', emoji: true },
+    value: `${recipientId}|task:${task.id}|${cleanTaskName(task.name).slice(0, 60)}`.slice(0, 2000),
+  };
 
   if (ruleId === 'overdue') {
     const days = Number(/Overdue by (\d+)/i.exec(match.detail)?.[1] ?? 0);
@@ -169,6 +190,7 @@ function taskRow(
     return [{
       type: 'section',
       text: { type: 'mrkdwn', text: `\`${position}\`  ${age}   *${title}*\n${' '.repeat(6)}${meta}` },
+      accessory: doneButton,
     }];
   }
 
@@ -179,7 +201,11 @@ function taskRow(
   ].filter(Boolean).join('  ·  ');
 
   return [
-    { type: 'section', text: { type: 'mrkdwn', text: `\`${position}\`  *${title}*\n>${esc(truncate(match.detail, SNIPPET_MAX))}` } },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: `\`${position}\`  *${title}*\n>${esc(truncate(match.detail, SNIPPET_MAX))}` },
+      accessory: doneButton,
+    },
     { type: 'context', elements: [{ type: 'mrkdwn', text: meta }] },
   ];
 }

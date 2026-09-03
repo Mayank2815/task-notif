@@ -46,3 +46,27 @@ test('the window starts at local midnight, not 24 hours back', () => {
   const now = DateTime.fromISO('2026-09-02T21:00', { zone: 'Asia/Kolkata' });
   assert.equal(digestWindow(config, now).start.toISO()?.slice(0, 16), '2026-09-02T00:00');
 });
+
+test('a day offset of 1 covers the whole of yesterday, not today so far', () => {
+  const config = ConfigSchema.parse({ timezone: 'Asia/Kolkata' });
+  const now = DateTime.fromISO('2026-09-04T09:15', { zone: 'Asia/Kolkata' });
+  const w = digestWindow(config, now, 1);
+  assert.equal(w.start.toFormat('yyyy-MM-dd HH:mm'), '2026-09-03 00:00');
+  assert.equal(w.end.toFormat('yyyy-MM-dd HH:mm'), '2026-09-03 23:59');
+  assert.equal(w.label, 'Thursday, 3 September');
+});
+
+test('yesterday is measured in the configured timezone, not UTC', () => {
+  const config = ConfigSchema.parse({ timezone: 'Asia/Kolkata' });
+  // 20:00 UTC is already the next morning in IST, so "yesterday" moves with it
+  const now = DateTime.fromISO('2026-09-03T20:00:00Z');
+  assert.equal(digestWindow(config, now, 1).start.toFormat('yyyy-MM-dd'), '2026-09-03');
+});
+
+test('offset 0 still means today up to now', () => {
+  const config = ConfigSchema.parse({ timezone: 'Asia/Kolkata' });
+  const now = DateTime.fromISO('2026-09-04T09:15', { zone: 'Asia/Kolkata' });
+  const w = digestWindow(config, now, 0);
+  assert.equal(w.start.toFormat('yyyy-MM-dd'), '2026-09-04');
+  assert.equal(w.end.toFormat('HH:mm'), '09:15');
+});

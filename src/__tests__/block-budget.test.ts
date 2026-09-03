@@ -69,7 +69,20 @@ test('headings sit at the top level, where Slack renders them large', () => {
   const r = renderReminder(fakeResult({ 'awaiting-response': 2, overdue: 3 }), 'Asia/Kolkata');
   assert.equal(r.attachments, undefined, 'no attachments — they suppress header sizing');
   const headers = (r.blocks as { type: string }[]).filter((b) => b.type === 'header');
-  assert.equal(headers.length, 3, 'one message header plus one per group');
+  assert.ok(headers.length >= 2, 'a greeting header plus the "needs you today" heading');
+});
+
+test('yesterday leads the morning message, today follows', () => {
+  const r = renderReminder(fakeResult({ overdue: 1 }), 'Asia/Kolkata', [], undefined, '• Closed 2 tasks');
+  const json = JSON.stringify(r.blocks);
+  assert.ok(json.indexOf('Yesterday') < json.indexOf('Needs you today'), 'stand-up half comes first');
+  assert.match(json, /Closed 2 tasks/);
+});
+
+test('with no yesterday summary the message is just today', () => {
+  const json = JSON.stringify(renderReminder(fakeResult({ overdue: 1 }), 'Asia/Kolkata').blocks);
+  assert.ok(!json.includes('Yesterday'));
+  assert.match(json, /Needs you today/);
 });
 
 test('the header carries a one-line tally', () => {

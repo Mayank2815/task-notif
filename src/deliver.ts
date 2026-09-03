@@ -7,7 +7,10 @@ import { collectWorkspace, makeClient, runScan, type ScanResult } from './pipeli
 import { SlackClient } from './slack/client.js';
 import { renderDigest } from './slack/digest-message.js';
 import { renderReminder } from './slack/message.js';
-import { SlackMentionSearch, userTokenFor, type SlackMention } from './slack/mentions.js';
+import {
+  SlackMentionSearch, userTokenFor,
+  type ChannelActivity, type MeetingMention, type SlackMention,
+} from './slack/mentions.js';
 
 export interface DeliveryOutcome {
   scan: ScanResult | null;
@@ -70,15 +73,41 @@ export async function runAndDeliver(
 
   if (job === 'reminder') {
     scan = await runScan(config, teamworkToken, log).catch(recordFailure);
+
+    // The morning message leads with yesterday, because that is what stand-up asks for.
+    const yesterdayByRecipient = new Map<string, string | null>();
+    if (config.includeYesterdayInReminder) {
+      const client = makeClient(config, teamworkToken);
+      const ws = await collectWorkspace(client, () => {}, config).catch(recordFailure);
+      const since = DateTime.now().setZone(config.timezone).minus({ days: 1 }).startOf('day').toUTC().toISO() ?? '';
+      const activity = await client.activitySince(since).catch(recordFailure);
+
+      for (const result of scan.results) {
+        const r = result.recipient;
+        const mentions = await slackMentionsFor(config, r.id, 'yesterday', log, names);
+        const { activity: slackActivity, meetings } = await slackDayFor(config, r.id, 1, log, names);
+        const digest = await buildDigest(
+          client, { ...ws, activity }, config, r, DateTime.now(), mentions, 1, slackActivity, meetings,
+        );
+        const summary = await writeStandupSummary(digest, config, (m) => log(`${r.label}: ${m}`));
+        log(`${r.label}: yesterday — ${digest.updates.length} worked on, ${digest.completed.length} closed, ${slackActivity.length} conversations, ${meetings.length} calls`);
+        yesterdayByRecipient.set(r.id, summary);
+      }
+    }
+
     for (const result of scan.results) {
       const awaiting = (await slackMentionsFor(config, result.recipient.id, 'pending', log, names)).filter((m) => !m.answered);
       messages.push({
         recipient: result.recipient,
         total: result.total + awaiting.length,
-        rendered: renderReminder(result, config.timezone, awaiting),
+        rendered: renderReminder(
+          result, config.timezone, awaiting, note, yesterdayByRecipient.get(result.recipient.id) ?? null,
+        ),
       });
     }
   } else {
+    // The evening digest covers today so far. Yesterday is reported by the morning
+    // reminder instead, so there is one message per half of the day rather than three.
     const client = makeClient(config, teamworkToken);
     const ws = await collectWorkspace(client, log, config).catch(recordFailure);
     const activity = await client
@@ -88,7 +117,10 @@ export async function runAndDeliver(
 
     for (const recipient of config.recipients.filter((r) => r.enabled)) {
       const mentions = await slackMentionsFor(config, recipient.id, 'today', log, names);
-      const digest = await buildDigest(client, { ...ws, activity }, config, recipient, DateTime.now(), mentions);
+      const { activity: slackActivity, meetings } = await slackDayFor(config, recipient.id, 0, log, names);
+      const digest = await buildDigest(
+        client, { ...ws, activity }, config, recipient, DateTime.now(), mentions, 0, slackActivity, meetings,
+      );
       digest.summary = await writeStandupSummary(digest, config, (m) => log(`${recipient.label}: ${m}`));
       log(
         `${recipient.label}: ${digest.updates.length} updates, ${digest.mentionsOpen.length} open, ` +
@@ -142,7 +174,7 @@ export async function runAndDeliver(
 async function slackMentionsFor(
   config: Config,
   recipientId: string,
-  window: 'today' | 'pending',
+  window: 'today' | 'yesterday' | 'pending',
   log: (m: string) => void,
   names: Map<string, string> = new Map(),
 ): Promise<SlackMention[]> {
@@ -160,7 +192,8 @@ async function slackMentionsFor(
     const found = window === 'today'
       ? await search.mentionsOn(DateTime.now(), config.timezone, config.slackBroadcastThreshold)
       : await search.mentionsSince(config.slackPendingDays, config.timezone, config.slackBroadcastThreshold);
-    const dismissed = new Set(getDismissals(recipientId).map((d) => d.key));
+    // Same rule as tasks: a thread marked done returns when something new is said in it.
+    const dismissedAt = new Map(getDismissals(recipientId).map((d) => [d.key, d.at]));
     const reasons: string[] = [];
     let kept = found;
 
@@ -174,7 +207,10 @@ async function slackMentionsFor(
     if (config.slackIgnoreCcOnly) drop((m) => m.ccOnly, 'cc-only');
     // Someone else who was tagged has picked it up.
     if (config.slackHideWhenCoMentionedReplied) drop((m) => !m.answered && m.answeredByOther, 'handled by a co-mentioned colleague');
-    drop((m) => dismissed.has(m.key), 'dismissed');
+    drop((m) => {
+      const at = dismissedAt.get(m.key);
+      return Boolean(at) && m.at <= at!;
+    }, 'marked done');
 
     log(`${recipientId}: ${kept.length} Slack mention(s) in the ${window} window${reasons.length ? ` (${reasons.join(', ')} dropped)` : ''}`);
     return kept;
@@ -182,5 +218,35 @@ async function slackMentionsFor(
     // Slack search failing must not cost them the Teamwork half of the message.
     log(`${recipientId}: Slack mention search failed — ${(err as Error).message}`);
     return [];
+  }
+}
+
+/** Where this person spoke, and what calls happened, on the day being reported. */
+async function slackDayFor(
+  config: Config,
+  recipientId: string,
+  dayOffset: number,
+  log: (m: string) => void,
+  names: Map<string, string>,
+): Promise<{ activity: ChannelActivity[]; meetings: MeetingMention[] }> {
+  if (!config.slackMentionsEnabled) return { activity: [], meetings: [] };
+
+  const recipient = config.recipients.find((r) => r.id === recipientId);
+  const token = userTokenFor(recipientId, recipient?.slackUserToken ?? '');
+  if (!token) return { activity: [], meetings: [] };
+
+  const day = DateTime.now().setZone(config.timezone).minus({ days: dayOffset });
+  try {
+    const search = new SlackMentionSearch(token, names);
+    const [activity, meetings] = await Promise.all([
+      search.myActivityOn(day, config.timezone),
+      config.includeMeetings ? search.meetingsOn(day, config.timezone) : Promise.resolve([]),
+    ]);
+    log(`${recipientId}: spoke in ${activity.length} Slack conversation(s), ${meetings.length} call(s) mentioned`);
+    return { activity, meetings };
+  } catch (err) {
+    // Losing this section must not cost the whole message.
+    log(`${recipientId}: Slack day summary failed — ${(err as Error).message}`);
+    return { activity: [], meetings: [] };
   }
 }

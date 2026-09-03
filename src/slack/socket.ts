@@ -159,7 +159,8 @@ export class SlackSocket {
     const responseUrl = typeof payload.response_url === 'string' ? payload.response_url : null;
 
     for (const action of actions) {
-      if (action.action_id !== 'dismiss_thread') continue;
+      // Slack threads and Teamwork tasks are dismissed the same way; only the key differs.
+      if (action.action_id !== 'dismiss_thread' && action.action_id !== 'dismiss_task') continue;
 
       const [recipientId, key, label] = String(action.value ?? '').split('|');
       if (!recipientId || !key) continue;

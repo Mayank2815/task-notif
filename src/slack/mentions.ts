@@ -34,6 +34,27 @@ interface SlackApiResponse {
 
 const GAP_MS = 1200; // search.messages is Tier 2 (~20/min); this keeps us comfortably under
 
+/** Domains and words that indicate a call was set up or held. */
+const MEETING_TERMS = ['meet.google.com', 'zoom.us', 'teams.microsoft.com', 'huddle'];
+
+export interface ChannelActivity {
+  channel: string;
+  isDm: boolean;
+  messages: number;
+  /** Newest message you posted there, for context. */
+  latest: string;
+  permalink: string;
+}
+
+export interface MeetingMention {
+  channel: string;
+  isDm: boolean;
+  author: string;
+  text: string;
+  at: string;
+  permalink: string;
+}
+
 /** Same courtesy-copy markers as the Teamwork side. */
 const CC_MARKERS = /\b(?:cc|bcc|fyi|copying|looping in|adding)\b[\s:,\-]*/gi;
 /** A run of raw Slack mention tokens, optionally comma/&/and separated. */
@@ -120,6 +141,73 @@ export class SlackMentionSearch {
    */
   async mentionsOn(date: DateTime, timezone: string, maxTaggedPeople = 0): Promise<SlackMention[]> {
     return this.runSearch(`on:${date.setZone(timezone).toFormat('yyyy-MM-dd')}`, maxTaggedPeople);
+  }
+
+  /**
+   * Where this person actually spoke on a given day, grouped by conversation.
+   * 100+ individual messages is noise; "12 messages in #x" is a stand-up line.
+   */
+  async myActivityOn(date: DateTime, timezone: string): Promise<ChannelActivity[]> {
+    const { username } = await this.whoami();
+    const day = date.setZone(timezone).toFormat('yyyy-MM-dd');
+    const search = await this.call<SlackApiResponse & { messages?: { matches?: Record<string, unknown>[] } }>(
+      'search.messages',
+      { query: `from:@${username} on:${day}`, count: '100', sort: 'timestamp' },
+    );
+
+    const grouped = new Map<string, ChannelActivity>();
+    for (const m of search.messages?.matches ?? []) {
+      const channel = (m.channel ?? {}) as Record<string, unknown>;
+      const isDm = Boolean(channel.is_im) || Boolean(channel.is_mpim);
+      const rawName = String(channel.name ?? channel.id ?? '');
+      // A DM's "name" is the other person's user id; show who it was instead.
+      const label = isDm ? `DM · ${this.names.get(rawName) ?? rawName}` : `#${rawName}`;
+
+      const existing = grouped.get(label);
+      const text = cleanText(String(m.text ?? ''), this.names);
+      if (existing) {
+        existing.messages += 1;
+        if (text) existing.latest = text;
+      } else {
+        grouped.set(label, {
+          channel: label, isDm, messages: 1, latest: text,
+          permalink: String(m.permalink ?? ''),
+        });
+      }
+    }
+
+    return [...grouped.values()].sort((a, b) => b.messages - a.messages);
+  }
+
+  /** Calls set up or held on a given day, in anything this person can see. */
+  async meetingsOn(date: DateTime, timezone: string): Promise<MeetingMention[]> {
+    const day = date.setZone(timezone).toFormat('yyyy-MM-dd');
+    const seen = new Set<string>();
+    const out: MeetingMention[] = [];
+
+    for (const term of MEETING_TERMS) {
+      const search = await this.call<SlackApiResponse & { messages?: { matches?: Record<string, unknown>[] } }>(
+        'search.messages',
+        { query: `${term} on:${day}`, count: '20', sort: 'timestamp' },
+      );
+      for (const m of search.messages?.matches ?? []) {
+        const permalink = String(m.permalink ?? '');
+        if (!permalink || seen.has(permalink)) continue;
+        seen.add(permalink);
+        const channel = (m.channel ?? {}) as Record<string, unknown>;
+        const isDm = Boolean(channel.is_im) || Boolean(channel.is_mpim);
+        out.push({
+          channel: isDm ? `DM · ${this.names.get(String(channel.name ?? '')) ?? 'direct message'}` : `#${channel.name ?? channel.id}`,
+          isDm,
+          author: this.names.get(String(m.user ?? '')) ?? String(m.username ?? 'someone'),
+          text: cleanText(String(m.text ?? ''), this.names),
+          at: tsToIso(String(m.ts ?? '')),
+          permalink,
+        });
+      }
+    }
+
+    return out.sort((a, b) => a.at.localeCompare(b.at));
   }
 
   /** Mentions from the last `days` days — used for the morning carry-forward. */

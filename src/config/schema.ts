@@ -40,9 +40,15 @@ export const ConfigSchema = z.object({
   jobs: z.object({
     /** Morning: what needs your attention. */
     reminder: JobSchema.default({ time: '09:00' }),
-    /** Evening: what you actually did, for tomorrow's standup. */
+    /** Evening: what you did today, while it is fresh. */
     digest: JobSchema.default({ time: '21:00' }),
   }).default({}),
+
+  /**
+   * Lead the morning reminder with yesterday's stand-up summary. One message beats
+   * two fifteen minutes apart, and stand-up needs both halves anyway.
+   */
+  includeYesterdayInReminder: z.boolean().default(true),
 
   /**
    * How late a missed slot may still be delivered after the machine comes back.
@@ -89,6 +95,8 @@ export const ConfigSchema = z.object({
    * semi-public, a DM is not, and the summary rarely needs its contents.
    */
   standupSummaryIncludeDmText: z.boolean().default(false),
+  /** Include calls and meeting links found in Slack. */
+  includeMeetings: z.boolean().default(true),
   /** How far back the morning reminder looks for still-unanswered Slack mentions. */
   slackPendingDays: z.number().int().min(1).max(30).default(3),
   /** Slack cc-only mentions are kept by default — a Slack cc often still matters. */

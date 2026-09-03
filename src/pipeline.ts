@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
 import type { Config, Recipient } from './config/schema.js';
+import { getDismissals } from './config/store.js';
 import { activeRules } from './rules/index.js';
 import type { RuleContext, RuleMatch } from './rules/types.js';
 import { buildIdentity, mentionsIdentity, type Identity } from './teamwork/identity.js';
@@ -189,6 +190,28 @@ async function evaluateRecipient(
       if (fetched && !fetched.completed) candidates.set(id, fetched);
     }
   }
+  /**
+   * A task marked done stays hidden until someone says something new on it.
+   * The dismissal records when it was pressed, so any comment after that moment
+   * revives the task — pressing Done again re-hides it from that point on.
+   */
+  const dismissedAt = new Map(getDismissals(recipient.id).map((d) => [d.key, d.at]));
+  let dismissedCount = 0;
+  let revivedCount = 0;
+
+  for (const [id] of [...candidates]) {
+    const at = dismissedAt.get(`task:${id}`);
+    if (!at) continue;
+
+    const latestComment = (ws.commentsByTask.get(id) ?? [])
+      .map((c) => c.postedAt ?? '')
+      .reduce((a, b) => (a > b ? a : b), '');
+
+    if (latestComment && latestComment > at) { revivedCount++; continue; }
+    candidates.delete(id);
+    dismissedCount++;
+  }
+
   const beforeRange = candidates.size;
   for (const [id, task] of [...candidates]) {
     if (!(await inScope(task))) candidates.delete(id);
@@ -196,7 +219,9 @@ async function evaluateRecipient(
   const dropped = beforeRange - candidates.size;
   log(
     `${identity.displayName}: ${assigned.length} assigned, ${mentionedTaskIds.size} mentioning, ` +
-    `${candidates.size} candidates${dropped ? ` (${dropped} outside the board range)` : ''}`,
+    `${candidates.size} candidates${dropped ? ` (${dropped} outside the board range)` : ''}` +
+    `${dismissedCount ? ` (${dismissedCount} marked done)` : ''}` +
+    `${revivedCount ? ` (${revivedCount} revived by a new comment)` : ''}`,
   );
 
   const now = DateTime.now();

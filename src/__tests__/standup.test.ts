@@ -7,6 +7,7 @@ import type { Digest } from '../digest.js';
 const empty = {
   updates: [], mentionsAnswered: [], mentionsOpen: [], completed: [],
   statusChanges: [], newlyAssigned: [], slackReplied: [], slackAwaiting: [],
+  slackActivity: [], meetings: [], dayOffset: 0,
   summary: null, total: 0,
 } as unknown as Digest;
 

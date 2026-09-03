@@ -341,6 +341,22 @@ A channel message that mentions them with no thread under it therefore reads as 
 - `slackBroadcastThreshold` (default 5) drops messages tagging more people than that. Without
   it a daily standup bot that @-mentions seven people appears in the digest every single day.
 
+### Marking something done
+
+Every task row and every Slack row carries a **✅ Done** button. Pressing it stops that
+item appearing in any future message — morning or evening.
+
+Tasks are keyed `task:<id>` and Slack threads `channelId:threadTimestamp`, so the two can
+never collide.
+
+**It hides the item until someone says something new.** The dismissal records the moment
+the button was pressed; a Teamwork comment or a Slack mention after that moment brings the
+item straight back. Pressing Done again re-hides it from the new moment on. That way
+finishing with a thread is one click, but a colleague reopening it is not silently lost.
+
+To drop an item permanently, delete its entry from the `dismissals` array in
+`data/store.json` — nothing will revive it once the record is gone.
+
 ### Marking a thread done
 
 Every Slack row carries a **✅ Done** button. It applies to *that one thread*, keyed on

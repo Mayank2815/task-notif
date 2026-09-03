@@ -6,6 +6,7 @@ import type { Digest } from '../digest.js';
 const base = {
   updates: [], mentionsAnswered: [], mentionsOpen: [], completed: [],
   statusChanges: [], newlyAssigned: [], slackReplied: [], slackAwaiting: [],
+  slackActivity: [], meetings: [], dayOffset: 0,
   summary: null, total: 0,
 } as unknown as Digest;
 
@@ -144,4 +145,27 @@ test('the blocked line de-duplicates too', () => {
     ],
   } as unknown as Digest;
   assert.equal(buildFactualSummary(digest)!.match(/Stuck thing/g)!.length, 2); // once in Worked on, once in Blocked
+});
+
+test('the summary names where you talked and which calls happened', () => {
+  const digest = {
+    ...base,
+    slackActivity: [
+      { channel: '#team-frontend-dev', messages: 22, permalink: 'https://s/1', isDm: false, latest: '' },
+      { channel: 'DM · Alice Doe', messages: 31, permalink: 'https://s/2', isDm: true, latest: '' },
+    ],
+    meetings: [{ channel: '#team-workflow-dev', author: 'Bob', text: 'call at 3:15', at: '', permalink: 'https://s/3', isDm: false }],
+  } as unknown as Digest;
+  const summary = buildFactualSummary(digest)!;
+  assert.match(summary, /\*Calls\* — <https:\/\/s\/3\|#team-workflow-dev>/);
+  assert.match(summary, /\*Talked in\*/);
+  assert.match(summary, /#team-frontend-dev>\s?\(22\)/);
+});
+
+test('a day with only Slack activity still produces a summary', () => {
+  const digest = {
+    ...base,
+    slackActivity: [{ channel: '#x', messages: 3, permalink: 'https://s/1', isDm: false, latest: '' }],
+  } as unknown as Digest;
+  assert.ok(buildFactualSummary(digest));
 });

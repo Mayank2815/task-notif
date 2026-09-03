@@ -56,6 +56,15 @@ export function buildFactualSummary(digest: Digest): string | null {
   }
 
   // Each answer named, so you can judge which is worth raising rather than a bare count.
+  if (digest.meetings.length > 0) {
+    lines.push(`*Calls* — ${digest.meetings.slice(0, 3).map((m) => link(m.permalink, esc(m.channel))).join('; ')}${more(digest.meetings.length, 3)}`);
+  }
+
+  if (digest.slackActivity.length > 0) {
+    const top = digest.slackActivity.slice(0, 4).map((a) => `${link(a.permalink, esc(a.channel))} (${a.messages})`);
+    lines.push(`*Talked in* — ${top.join('; ')}${more(digest.slackActivity.length, 4)}`);
+  }
+
   const answered = [
     ...digest.mentionsAnswered.map((m) => `${esc(m.author)} on ${link(m.link, trim(m.taskName))}`),
     ...digest.slackReplied.map((m) => `${esc(m.author)} in ${link(m.permalink, m.isDm ? 'DM' : `#${m.channelName}`)}`),
