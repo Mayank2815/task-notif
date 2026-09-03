@@ -22,6 +22,8 @@ export interface TeamworkTask {
   url: string;
   workflowId?: number;
   stageId?: number;
+  /** Subtasks carry no board column of their own — the parent holds it. */
+  parentTaskId?: number;
   /** Board column, e.g. "Ready for QA". Resolved separately — tasks carry only the id. */
   stageName?: string;
 }

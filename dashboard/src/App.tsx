@@ -247,7 +247,7 @@ export default function App() {
             <div className="recipient" style={{ borderColor: 'var(--accent)' }}>
               <label className="field" style={{ marginBottom: 12 }}>
                 Search {people.length > 0 ? `${people.length} Teamwork people` : 'Teamwork people'} — by name, email or @handle
-                <input autoFocus value={search} placeholder="e.g. Nikhil, @tar, tarun@…"
+                <input autoFocus value={search} placeholder="e.g. Nikhil, @nik, nikhil@…"
                   onChange={(e) => setSearch(e.target.value)} />
               </label>
 

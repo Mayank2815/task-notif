@@ -55,8 +55,22 @@ export const ConfigSchema = z.object({
 
   sendWhenEmpty: z.boolean().default(false),
   enabled: z.boolean().default(true),
+  /**
+   * While set, every MANUAL send goes only to this recipient, whatever was asked for.
+   * Scheduled runs are unaffected. A guard for testing against live people.
+   */
+  manualSendOnlyTo: z.string().default(''),
 
-  lookbackDays: z.number().int().min(1).max(365).default(60),
+  lookbackDays: z.number().int().min(1).max(365).default(30),
+  /**
+   * Only surface tasks sitting between these board columns, inclusive. Matched
+   * leniently on name; the first anchor present on a board wins. A board with
+   * neither anchor is left unfiltered rather than silently emptied.
+   */
+  stageRangeStart: z.array(z.string()).default(['Sprint Backlog']),
+  stageRangeEnd: z.array(z.string()).default(['BA Signed-off', 'QA Signed-off']),
+  /** Include tasks that sit on no board column at all. */
+  includeTasksWithoutStage: z.boolean().default(true),
   /** Rule C: treat tasks due today as needing attention, not just strictly past-due. */
   includeDueToday: z.boolean().default(true),
   /** Skip comments that only name you inside a "cc"/"fyi" list — nothing is being asked of you. */

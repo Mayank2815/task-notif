@@ -11,7 +11,7 @@ async function main(): Promise<void> {
 
   const config = getConfig();
   const client = makeClient(config, token);
-  const ws = await collectWorkspace(client, (m) => console.log(`[scan] ${m}`));
+  const ws = await collectWorkspace(client, (m) => console.log(`[scan] ${m}`), config);
   const since = DateTime.now().setZone(config.timezone).startOf('day').toUTC().toISO() ?? '';
   const activity = await client.activitySince(since);
   console.log(`[scan] ${activity.length} activity entries since ${since}`);

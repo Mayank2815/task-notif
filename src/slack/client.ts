@@ -100,11 +100,15 @@ export class SlackClient {
     return map;
   }
 
-  /** postMessage opens the DM itself when given a user ID, so no im:write scope is needed. */
-  async postMessage(channel: string, text: string, blocks: unknown[]): Promise<string> {
+  /**
+   * postMessage opens the DM itself when given a user ID, so no im:write scope is needed.
+   * Attachments are used purely for their coloured left bar — the only way Slack lets a
+   * message carry colour, and what makes a long list scannable.
+   */
+  async postMessage(channel: string, text: string, blocks: unknown[], attachments: unknown[] = []): Promise<string> {
     const r = await this.call<SlackResponse & { ts: string }>(
       'chat.postMessage',
-      { channel, text, blocks, unfurl_links: false, unfurl_media: false },
+      { channel, text, blocks, ...(attachments.length ? { attachments } : {}), unfurl_links: false, unfurl_media: false },
       'json',
     );
     return r.ts;

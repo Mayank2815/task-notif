@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { muteRow } from '../slack/socket.js';
 
-const VALUE = 'mayank|G01A5LG5ZPX:1788242536.831209|#team_workflow_dev';
+const VALUE = 'alice|G01A5LG5ZPX:1788242536.831209|#team_workflow_dev';
 
 const blocks = (): Record<string, unknown>[] => [
   { type: 'header', text: { type: 'plain_text', text: '📋 24 items need your attention' } },
@@ -17,7 +17,7 @@ const blocks = (): Record<string, unknown>[] => [
   {
     type: 'section',
     text: { type: 'mrkdwn', text: '*#team_frontend_dev*\n_Sure will check them_' },
-    accessory: { type: 'button', action_id: 'dismiss_thread', value: 'mayank|G011LCJNCHZ:1|#team_frontend_dev' },
+    accessory: { type: 'button', action_id: 'dismiss_thread', value: 'alice|G011LCJNCHZ:1|#team_frontend_dev' },
   },
   { type: 'context', elements: [{ type: 'mrkdwn', text: 'Arjun Rao · 2026-09-02' }] },
 ];

@@ -130,6 +130,13 @@ Either way, a restart inside the window still sends: on boot the scheduler check
 the slot was missed (`catchUpGraceMinutes`, 5 hours by default) and whether it was already
 delivered, so you get it once, marked late, and never twice.
 
+**A failed run retries rather than waiting for tomorrow.** A laptop waking at 09:00 often
+has no network for the first minute, and the scan then fails outright. Retries run at 1, 3,
+10 and 30 minutes — about the first three quarters of an hour — after which it gives up
+until the next slot rather than hammering a real outage. Retried sends are marked late.
+A failure during the scan is written to the run history too; previously it threw before any
+bookkeeping, so a lost run left no trace in the dashboard at all.
+
 ### Deploying to an Oracle Cloud Always Free VM
 
 Oracle's free tier gives a permanently-on VM rather than a trial or a sleeping

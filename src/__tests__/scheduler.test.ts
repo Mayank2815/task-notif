@@ -96,3 +96,48 @@ test('catch-up still fires when the last run was yesterday', () => {
 test('no catch-up on a disabled weekday', () => {
   assert.equal(shouldCatchUp(base, job, at('2026-09-05T10:30'), null), false); // Saturday
 });
+
+// The real configuration: 09:00 reminder, 5-hour grace.
+const live = ConfigSchema.parse({ timezone: IST, jobs: { reminder: { time: '09:00' } }, catchUpGraceMinutes: 300 });
+const liveJob = live.jobs.reminder;
+
+test('a machine switched on at 11:00 still gets the missed 09:00 reminder', () => {
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:00'), null), true);
+});
+
+test('a failed run does not count as delivered — only successes are passed in', () => {
+  // The scheduler filters on ok, so a failure never reaches this argument and the
+  // slot stays owed. A genuine success at 09:00 does suppress it.
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:00'), null), true);
+  const deliveredAt = at('2026-09-03T09:00').toISO()!;
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:00'), deliveredAt), false);
+});
+
+test('switched on at 13:59 — just inside the 5-hour grace', () => {
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T13:59'), null), true);
+});
+
+test('switched on at 14:30 — past the grace, skipped rather than sending a stale list', () => {
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T14:30'), null), false);
+});
+
+test('a longer grace covers a machine switched on much later', () => {
+  const patient = ConfigSchema.parse({ ...live, catchUpGraceMinutes: 720 });
+  assert.equal(shouldCatchUp(patient, patient.jobs.reminder, at('2026-09-03T20:00'), null), true);
+});
+
+test('a manual send after the slot satisfies it — no duplicate on restart', () => {
+  // Sent by hand at 09:45 after the 09:00 slot was missed, then the app restarts at 11:29.
+  const sentByHand = at('2026-09-03T09:45').toISO()!;
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:29'), sentByHand), false);
+});
+
+test('a manual send BEFORE the slot does not satisfy it', () => {
+  const sentEarly = at('2026-09-03T08:00').toISO()!;
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:00'), sentEarly), true);
+});
+
+test('yesterday\'s successful send does not satisfy today', () => {
+  const yesterday = at('2026-09-02T09:00').toISO()!;
+  assert.equal(shouldCatchUp(live, liveJob, at('2026-09-03T11:00'), yesterday), true);
+});

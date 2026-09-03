@@ -44,3 +44,75 @@ test('an empty section contributes nothing, not a bare header', () => {
   const blocks = assembleWithBudget(intro, [section(0), section(2)]);
   assert.equal(blocks.length, 2 + 2 + 4);
 });
+
+import { renderReminder } from '../slack/message.js';
+
+const fakeResult = (counts: Record<string, number>): Parameters<typeof renderReminder>[0] => ({
+  recipient: { id: 'alice', label: 'Alice Doe' },
+  identity: { displayName: 'Alice Doe' },
+  total: Object.values(counts).reduce((a, b) => a + b, 0),
+  groups: Object.entries(counts).map(([ruleId, n]) => ({
+    ruleId,
+    label: ruleId,
+    items: Array.from({ length: n }, (_, i) => ({
+      task: { id: i, name: `Task ${i} *`, projectName: 'Proj', stageName: 'Ready for QA', dueDate: '2026-07-16', url: 'https://tw/1' },
+      match: { ruleId, detail: 'Overdue by 49 days (due 16 Jul 2026)', link: 'https://tw/1' },
+      ruleLabel: ruleId,
+      assigneeNames: ['Alice Doe'],
+    })),
+  })),
+}) as unknown as Parameters<typeof renderReminder>[0];
+
+test('headings sit at the top level, where Slack renders them large', () => {
+  // Inside an attachment Slack downgrades a header block to ordinary bold text,
+  // which is why the sections looked identical to the rows beneath them.
+  const r = renderReminder(fakeResult({ 'awaiting-response': 2, overdue: 3 }), 'Asia/Kolkata');
+  assert.equal(r.attachments, undefined, 'no attachments — they suppress header sizing');
+  const headers = (r.blocks as { type: string }[]).filter((b) => b.type === 'header');
+  assert.equal(headers.length, 3, 'one message header plus one per group');
+});
+
+test('the header carries a one-line tally', () => {
+  const r = renderReminder(fakeResult({ overdue: 3 }), 'Asia/Kolkata');
+  assert.match(JSON.stringify(r.blocks), /3 overdue/);
+});
+
+test('overdue rows show an age marker, not a repeated sentence', () => {
+  const json = JSON.stringify(renderReminder(fakeResult({ overdue: 2 }), 'Asia/Kolkata').blocks);
+  assert.match(json, /🔴 49d/);
+  assert.ok(!json.includes('Overdue by 49 days'), 'the long form should be gone');
+});
+
+test('rows are numbered so they can be called out in stand-up', () => {
+  const json = JSON.stringify(renderReminder(fakeResult({ overdue: 2 }), 'Asia/Kolkata').blocks);
+  assert.match(json, /`1`/);
+  assert.match(json, /`2`/);
+});
+
+test('the trailing asterisk is gone from titles', () => {
+  const json = JSON.stringify(renderReminder(fakeResult({ overdue: 1 }), 'Asia/Kolkata').blocks);
+  assert.match(json, /\|Task 0>/, 'link label should be the cleaned name');
+  assert.ok(!json.includes('|Task 0 *>'), 'the trailing asterisk should not survive');
+});
+
+test('an empty day says so without inventing groups', () => {
+  const r = renderReminder(fakeResult({}), 'Asia/Kolkata');
+  assert.match(JSON.stringify(r.blocks), /All clear/);
+  assert.equal(r.attachments, undefined);
+});
+
+test('every section heading is a header block, preceded by a divider', () => {
+  const r = renderReminder(fakeResult({ 'awaiting-response': 1, overdue: 1 }), 'Asia/Kolkata');
+  const blocks = r.blocks as { type: string }[];
+  const groupHeaders = blocks.map((b, i) => ({ b, i })).filter(({ b }) => b.type === 'header').slice(1);
+  for (const { i } of groupHeaders) {
+    assert.equal(blocks[i - 1]!.type, 'divider', 'a divider should separate sections');
+  }
+});
+
+test('a heading is plain text — Slack header blocks reject mrkdwn', () => {
+  const r = renderReminder(fakeResult({ overdue: 1 }), 'Asia/Kolkata');
+  const head = (r.blocks as { type: string; text: { type: string; text: string } }[]).filter((b) => b.type === 'header')[1]!;
+  assert.equal(head.text.type, 'plain_text');
+  assert.ok(!head.text.text.includes('*'), 'no bold markers in a header');
+});

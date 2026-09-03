@@ -4,6 +4,7 @@ import { activeRules } from './rules/index.js';
 import type { RuleContext, RuleMatch } from './rules/types.js';
 import { buildIdentity, mentionsIdentity, type Identity } from './teamwork/identity.js';
 import { TeamworkClient } from './teamwork/client.js';
+import { stageIdsInRange } from './teamwork/stage-range.js';
 import type { TeamworkComment, TeamworkTask, TeamworkUser } from './teamwork/types.js';
 
 export interface MatchedTask {
@@ -34,6 +35,12 @@ export interface Workspace {
   commentsByTask: Map<number, TeamworkComment[]>;
   tasksById: Map<number, TeamworkTask>;
   usersById: Map<number, TeamworkUser>;
+  /** workflowId -> stage ids inside the configured range, or null when unfiltered. */
+  inRangeByWorkflow: Map<number, Set<number> | null>;
+  /** workflowId -> every stage id the board actually has, for spotting stale ids. */
+  knownStageIds: Map<number, Set<number>>;
+  /** workflowId -> stageId -> column name. Tasks fetched outside the sweep need this too. */
+  stageNames: Map<number, Map<number, string>>;
   commentCount: number;
 }
 
@@ -44,6 +51,7 @@ export function makeClient(config: Config, apiToken: string): TeamworkClient {
 export async function collectWorkspace(
   client: TeamworkClient,
   log: (m: string) => void,
+  config: Config,
 ): Promise<Workspace> {
   const comments = await client.recentTaskComments((n) => {
     if (n % 2500 === 0) log(`  …swept ${n} comments`);
@@ -68,17 +76,27 @@ export async function collectWorkspace(
   const people = await client.people();
   const usersById = new Map(people.map((p) => [p.id, p]));
 
-  // Resolve board columns once per workflow rather than once per task.
+  // Resolve board columns once per workflow rather than once per task, and work out
+  // which stages fall inside the configured range while we have them.
   const workflowIds = [...new Set([...tasksById.values()].map((t) => t.workflowId).filter((id): id is number => Boolean(id)))];
+  const inRangeByWorkflow = new Map<number, Set<number> | null>();
+  const knownStageIds = new Map<number, Set<number>>();
+  const stageNames = new Map<number, Map<number, string>>();
+
   for (const workflowId of workflowIds) {
     const stages = await client.workflowStages(workflowId);
+    knownStageIds.set(workflowId, new Set(stages.map((s) => s.id)));
+    const names = new Map(stages.map((s) => [s.id, s.name]));
+    stageNames.set(workflowId, names);
     for (const task of tasksById.values()) {
-      if (task.workflowId === workflowId && task.stageId) task.stageName = stages.get(task.stageId);
+      if (task.workflowId === workflowId && task.stageId) task.stageName = names.get(task.stageId);
     }
+    inRangeByWorkflow.set(workflowId, stageIdsInRange(stages, config.stageRangeStart, config.stageRangeEnd));
   }
-  log(`resolved board columns for ${workflowIds.length} workflow(s)`);
+  const unanchored = [...inRangeByWorkflow.values()].filter((v) => v === null).length;
+  log(`resolved board columns for ${workflowIds.length} workflow(s)${unanchored ? `, ${unanchored} without a recognisable range (left unfiltered)` : ''}`);
 
-  return { commentsByTask, tasksById, usersById, commentCount: comments.length };
+  return { commentsByTask, tasksById, usersById, inRangeByWorkflow, knownStageIds, stageNames, commentCount: comments.length };
 }
 
 async function evaluateRecipient(
@@ -93,11 +111,69 @@ async function evaluateRecipient(
   const identity = buildIdentity(user, recipient.handles);
 
   const assigned = await client.tasksAssignedTo(identity.userId);
+  // tasksAssignedTo returns its own objects, so the sweep's column names are not on
+  // them. Without this, every assigned task shows a blank board column.
+  for (const t of assigned) {
+    if (t.workflowId && t.stageId && !t.stageName) {
+      t.stageName = ws.stageNames.get(t.workflowId)?.get(t.stageId);
+    }
+  }
 
   const mentionedTaskIds = new Set<number>();
   for (const [taskId, comments] of ws.commentsByTask) {
     if (comments.some((c) => mentionsIdentity(c, identity))) mentionedTaskIds.add(taskId);
   }
+
+  /**
+   * A subtask sits on no board column of its own — the parent holds it. Walk up until
+   * a column is found, so "FE: <something>" under a parent in Ready for QA counts as
+   * being in Ready for QA. Capped, because a cycle would otherwise loop forever.
+   */
+  const MAX_PARENT_DEPTH = 4;
+  const stageOf = async (t: TeamworkTask): Promise<{ workflowId?: number; stageId?: number; inherited: boolean }> => {
+    if (t.workflowId && t.stageId) return { workflowId: t.workflowId, stageId: t.stageId, inherited: false };
+
+    let parentId = t.parentTaskId;
+    for (let depth = 0; depth < MAX_PARENT_DEPTH && parentId; depth++) {
+      const parent = ws.tasksById.get(parentId) ?? (await fetchParent(parentId));
+      if (!parent) break;
+      if (parent.workflowId && parent.stageId) {
+        return { workflowId: parent.workflowId, stageId: parent.stageId, inherited: true };
+      }
+      parentId = parent.parentTaskId;
+    }
+    return { inherited: false };
+  };
+
+  const parentCache = new Map<number, TeamworkTask | null>();
+  async function fetchParent(id: number): Promise<TeamworkTask | null> {
+    if (parentCache.has(id)) return parentCache.get(id) ?? null;
+    const parent = await client.task(id);
+    if (parent?.workflowId && parent.stageId && !parent.stageName) {
+      parent.stageName = ws.stageNames.get(parent.workflowId)?.get(parent.stageId);
+    }
+    parentCache.set(id, parent);
+    return parent;
+  }
+
+  /**
+   * A task is out of scope only when we can positively place its column outside the
+   * range. Anything we cannot resolve — no column anywhere up the chain, an unreadable
+   * board, or a stage id missing from the board's list — falls back to the config.
+   */
+  const inScope = async (t: TeamworkTask): Promise<boolean> => {
+    const { workflowId, stageId, inherited } = await stageOf(t);
+    if (!workflowId || !stageId) return config.includeTasksWithoutStage;
+
+    const allowed = ws.inRangeByWorkflow.get(workflowId) ?? null;
+    if (!allowed) return true;
+    const known = ws.knownStageIds.get(workflowId);
+    if (known && !known.has(stageId)) return true; // stale or unlisted column
+    if (inherited && !t.stageName) {
+      t.stageName = ws.stageNames.get(workflowId)?.get(stageId); // show the parent's column
+    }
+    return allowed.has(stageId);
+  };
 
   // Hard exclude: a task this person appears on nowhere can never match.
   // Assignment or a mention is the entry ticket; follower-only tasks trip no rule.
@@ -113,7 +189,15 @@ async function evaluateRecipient(
       if (fetched && !fetched.completed) candidates.set(id, fetched);
     }
   }
-  log(`${identity.displayName}: ${assigned.length} assigned, ${mentionedTaskIds.size} mentioning, ${candidates.size} candidates`);
+  const beforeRange = candidates.size;
+  for (const [id, task] of [...candidates]) {
+    if (!(await inScope(task))) candidates.delete(id);
+  }
+  const dropped = beforeRange - candidates.size;
+  log(
+    `${identity.displayName}: ${assigned.length} assigned, ${mentionedTaskIds.size} mentioning, ` +
+    `${candidates.size} candidates${dropped ? ` (${dropped} outside the board range)` : ''}`,
+  );
 
   const now = DateTime.now();
   const rules = activeRules(config.disabledRules);
@@ -146,7 +230,7 @@ async function evaluateRecipient(
 export async function runScan(config: Config, apiToken: string, log: (m: string) => void = () => {}): Promise<ScanResult> {
   const started = Date.now();
   const client = makeClient(config, apiToken);
-  const ws = await collectWorkspace(client, log);
+  const ws = await collectWorkspace(client, log, config);
 
   const active = config.recipients.filter((r) => r.enabled);
   const results: RecipientResult[] = [];

@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
 import type { RecipientResult } from '../pipeline.js';
+import { cleanTaskName } from '../teamwork/identity.js';
 import type { SlackMention } from './mentions.js';
 
 const MAX_ITEMS_PER_GROUP = 12;
@@ -69,6 +70,23 @@ function link(url: string, label: string): string {
 export interface RenderedMessage {
   text: string;
   blocks: unknown[];
+  /** Coloured groups. Slack only exposes colour through attachments. */
+  attachments?: unknown[];
+}
+
+/** One colour per reason, so urgency reads before the words do. */
+const GROUP_COLOUR: Record<string, string> = {
+  'awaiting-response': '#a371f7',
+  'action-requested': '#d29922',
+  overdue: '#f85149',
+  slack: '#4c8dff',
+};
+
+/** Redder the longer it has been sitting. */
+function ageMarker(days: number): string {
+  if (days >= 30) return '🔴';
+  if (days >= 7) return '🟠';
+  return '🟡';
 }
 
 export function renderReminder(
@@ -84,53 +102,100 @@ export function renderReminder(
     return {
       text: `Nothing pending — ${today}`,
       blocks: [
-        { type: 'header', text: { type: 'plain_text', text: '✅ Nothing pending', emoji: true } },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)} · no tasks need your attention` }] },
+        { type: 'header', text: { type: 'plain_text', text: '✅ All clear', emoji: true } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)} · nothing needs you right now` }] },
       ],
     };
   }
 
   const totalItems = result.total + slackAwaiting.length;
+
+  const tally = [
+    ...result.groups.map((g) => `${groupEmoji(g.ruleId)} ${g.items.length} ${shortLabel(g.ruleId)}`),
+    slackAwaiting.length > 0 ? `💬 ${slackAwaiting.length} slack` : null,
+  ].filter(Boolean).join('   ');
+
   const intro: unknown[] = [
-    {
-      type: 'header',
-      text: { type: 'plain_text', text: `📋 ${totalItems} item${totalItems === 1 ? '' : 's'} need your attention`, emoji: true },
-    },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)} · for ${esc(name)}${note ? `  ·  ${esc(note)}` : ''}` }] },
+    { type: 'header', text: { type: 'plain_text', text: `${totalItems} need${totalItems === 1 ? 's' : ''} you today`, emoji: true } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(today)} · ${esc(name)}${note ? `  ·  ${esc(note)}` : ''}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: tally }] },
   ];
 
   const sections: BlockSection[] = result.groups.map((group) => ({
+    // Top level, not inside an attachment: Slack only renders a header block large
+    // at the top level, which is what makes a heading read as a heading.
     header: [
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: `*${groupEmoji(group.ruleId)} ${esc(group.label)}* · ${group.items.length}` } },
+      sectionHeading(`${groupEmoji(group.ruleId)} ${group.label} · ${group.items.length}`),
     ],
-    items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map(({ task, match, assigneeNames }) => {
-      const meta = [
-        task.projectName ? esc(task.projectName) : null,
-        assigneeNames.length ? esc(assigneeNames.join(', ')) : 'unassigned',
-        task.dueDate ? `due ${esc(task.dueDate)}` : null,
-      ].filter(Boolean).join('  ·  ');
-
-      return [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${link(match.link, task.name)}*\n_${esc(truncate(match.detail, SNIPPET_MAX))}_` } },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: meta }] },
-      ];
+    items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map((item, index) => taskRow(item, group.ruleId, index + 1)),
+    more: (hidden: number) => ({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, group.items.length - MAX_ITEMS_PER_GROUP)} more_` }],
     }),
-    more: (hidden: number) => ({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, group.items.length - MAX_ITEMS_PER_GROUP)} more_` }] }),
   }));
 
   if (slackAwaiting.length > 0) {
     sections.push({
       header: [
         { type: 'divider' },
-        { type: 'section', text: { type: 'mrkdwn', text: `*💬 Slack — still unanswered* · ${slackAwaiting.length}` } },
+        sectionHeading(`💬 Slack — still unanswered · ${slackAwaiting.length}`),
       ],
       items: slackAwaiting.slice(0, MAX_SLACK_ROWS).map((m) => slackRow(m, result.recipient.id)),
-      more: (hidden: number) => ({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, slackAwaiting.length - MAX_SLACK_ROWS)} more_` }] }),
+      more: (hidden: number) => ({
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, slackAwaiting.length - MAX_SLACK_ROWS)} more_` }],
+      }),
     });
   }
 
   return { text: `${totalItems} items need your attention — ${today}`, blocks: assembleWithBudget(intro, sections) };
+}
+
+/** One task, numbered so it can be referred to out loud in stand-up. */
+function taskRow(
+  item: RecipientResult['groups'][number]['items'][number],
+  ruleId: string,
+  position: number,
+): unknown[] {
+  const { task, match, assigneeNames } = item;
+  const title = link(match.link, cleanTaskName(task.name));
+
+  if (ruleId === 'overdue') {
+    const days = Number(/Overdue by (\d+)/i.exec(match.detail)?.[1] ?? 0);
+    const age = days > 0 ? `${ageMarker(days)} ${days}d` : '🟡 today';
+    const meta = [task.projectName ? esc(task.projectName) : null, task.stageName ? esc(task.stageName) : null]
+      .filter(Boolean).join('  ·  ');
+    return [{
+      type: 'section',
+      text: { type: 'mrkdwn', text: `\`${position}\`  ${age}   *${title}*\n${' '.repeat(6)}${meta}` },
+    }];
+  }
+
+  const meta = [
+    task.projectName ? esc(task.projectName) : null,
+    assigneeNames.length ? esc(assigneeNames.join(', ')) : 'unassigned',
+    task.dueDate ? `due ${esc(friendlyDate(task.dueDate))}` : null,
+  ].filter(Boolean).join('  ·  ');
+
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: `\`${position}\`  *${title}*\n>${esc(truncate(match.detail, SNIPPET_MAX))}` } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: meta }] },
+  ];
+}
+
+/** Slack header blocks are plain text only, capped at 150 characters. */
+export function sectionHeading(text: string): unknown {
+  return { type: 'header', text: { type: 'plain_text', text: text.slice(0, 150), emoji: true } };
+}
+
+function shortLabel(ruleId: string): string {
+  switch (ruleId) {
+    case 'awaiting-response': return 'to reply';
+    case 'action-requested': return 'asked of you';
+    case 'overdue': return 'overdue';
+    default: return 'other';
+  }
 }
 
 /**
@@ -149,7 +214,7 @@ export function slackRow(m: SlackMention, recipientId: string): unknown[] {
   return [
     {
       type: 'section',
-      text: { type: 'mrkdwn', text: `*${link(m.permalink, where)}*\n_${esc(truncate(m.text, SNIPPET_MAX))}_` },
+      text: { type: 'mrkdwn', text: `*${link(m.permalink, where)}*\n>${esc(truncate(m.text, SNIPPET_MAX))}` },
       accessory: {
         type: 'button',
         action_id: 'dismiss_thread',
@@ -158,7 +223,7 @@ export function slackRow(m: SlackMention, recipientId: string): unknown[] {
         value: `${recipientId}|${m.key}|${where}`.slice(0, 2000),
       },
     },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(m.author)}  ·  ${esc(m.at.slice(0, 10))}${handled}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(m.author)}  ·  ${esc(friendlyDate(m.at.slice(0, 10)))}${handled}` }] },
   ];
 }
 
@@ -168,6 +233,20 @@ export function renderSlackRows(mentions: SlackMention[], recipientId: string): 
     rows.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${mentions.length - MAX_SLACK_ROWS} more_` }] });
   }
   return rows;
+}
+
+/** "Overdue by 49 days (due 16 Jul 2026)" -> "49 days overdue" */
+function shortOverdue(detail: string): string {
+  const m = /Overdue by (\d+) days?/i.exec(detail);
+  if (m) return `${m[1]} days overdue`;
+  return detail.replace(/\s*\(due [^)]*\)/, '');
+}
+
+/** "2026-07-16" -> "16 Jul" — the year is noise for anything this side of a birthday. */
+function friendlyDate(iso: string): string {
+  const d = DateTime.fromISO(iso);
+  if (!d.isValid) return iso;
+  return d.year === DateTime.now().year ? d.toFormat('d LLL') : d.toFormat('d LLL yyyy');
 }
 
 function groupEmoji(ruleId: string): string {

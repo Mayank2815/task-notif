@@ -1,3 +1,4 @@
+import type { Stage } from './stage-range.js';
 import type { TeamworkActivity, TeamworkComment, TeamworkTask, TeamworkUser, V3Envelope } from './types.js';
 
 export interface TeamworkClientOptions {
@@ -249,23 +250,24 @@ export class TeamworkClient {
     return out;
   }
 
-  /** Board column names for a workflow, keyed by stage id. */
-  async workflowStages(workflowId: number): Promise<Map<number, string>> {
-    const map = new Map<number, string>();
+  /**
+   * Board columns for a workflow. `displayOrder` is the real left-to-right order —
+   * the array order the API returns is not (one board lists Sprint Backlog
+   * before the Backlog columns that precede it on the board).
+   */
+  async workflowStages(workflowId: number): Promise<Stage[]> {
     try {
       const { rows } = await this.paginate<Record<string, unknown>>(
         `/projects/api/v3/workflows/${workflowId}/stages.json`,
         'stages',
       );
-      for (const row of rows) {
-        const id = num(row.id);
-        const name = str(row.name);
-        if (id && name) map.set(id, name);
-      }
+      return rows
+        .map((row) => ({ id: num(row.id) ?? 0, name: str(row.name) ?? '', displayOrder: Number(row.displayOrder ?? 0) }))
+        .filter((s) => s.id > 0 && s.name.length > 0);
     } catch {
-      // A workflow we cannot read just means no column name on those tasks.
+      // A workflow we cannot read just means no column names on those tasks.
+      return [];
     }
-    return map;
   }
 
   async comments(taskId: number): Promise<TeamworkComment[]> {
@@ -300,6 +302,7 @@ export class TeamworkClient {
       url: `${this.base}/app/tasks/${id}`,
       workflowId: num(stage?.workflowId),
       stageId: num(stage?.stageId),
+      parentTaskId: num(t.parentTaskId) ?? num((t.parentTask as Record<string, unknown> | undefined)?.id),
     };
   }
 

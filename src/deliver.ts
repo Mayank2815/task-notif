@@ -17,7 +17,7 @@ export interface DeliveryOutcome {
 /** Builds the right message for the job and DMs each enabled recipient.
  *  One recipient failing must not stop the others. */
 export async function runAndDeliver(
-  config: Config,
+  configInput: Config,
   teamworkToken: string,
   slackToken: string,
   job: JobKind,
@@ -25,8 +25,34 @@ export async function runAndDeliver(
   log: (m: string) => void = () => {},
   note?: string,
 ): Promise<DeliveryOutcome> {
+  // Testing must not reach colleagues. This narrows manual sends no matter how they
+  // were invoked — CLI, dashboard button, or an explicit recipient in the request.
+  let config = configInput;
+  if (trigger === 'manual' && config.manualSendOnlyTo) {
+    const only = config.manualSendOnlyTo;
+    const known = config.recipients.some((r) => r.id === only);
+    if (!known) throw new Error(`manualSendOnlyTo is "${only}" but no such recipient exists`);
+    const suppressed = config.recipients.filter((r) => r.enabled && r.id !== only).map((r) => r.id);
+    if (suppressed.length > 0) log(`manual send restricted to "${only}" — not sending to ${suppressed.join(', ')}`);
+    config = { ...config, recipients: config.recipients.map((r) => ({ ...r, enabled: r.id === only })) };
+  }
+
   const slack = new SlackClient(slackToken);
   const perRecipient: DeliveryOutcome['perRecipient'] = [];
+
+  // A failure during the scan happens before any per-recipient bookkeeping, so it
+  // would otherwise vanish — the dashboard would show nothing at all for that slot.
+  const recordFailure = (err: Error): never => {
+    recordRun({
+      at: new Date().toISOString(),
+      job,
+      trigger,
+      ok: false,
+      detail: `scan failed before sending: ${err.message}`,
+      perRecipient: [],
+    });
+    throw err;
+  };
 
   // Fetched once and shared: mention text is full of raw "<@U123>" ids otherwise.
   let names = new Map<string, string>();
@@ -43,7 +69,7 @@ export async function runAndDeliver(
   let scan: ScanResult | null = null;
 
   if (job === 'reminder') {
-    scan = await runScan(config, teamworkToken, log);
+    scan = await runScan(config, teamworkToken, log).catch(recordFailure);
     for (const result of scan.results) {
       const awaiting = (await slackMentionsFor(config, result.recipient.id, 'pending', log, names)).filter((m) => !m.answered);
       messages.push({
@@ -54,8 +80,10 @@ export async function runAndDeliver(
     }
   } else {
     const client = makeClient(config, teamworkToken);
-    const ws = await collectWorkspace(client, log);
-    const activity = await client.activitySince(DateTime.now().setZone(config.timezone).startOf('day').toUTC().toISO() ?? '');
+    const ws = await collectWorkspace(client, log, config).catch(recordFailure);
+    const activity = await client
+      .activitySince(DateTime.now().setZone(config.timezone).startOf('day').toUTC().toISO() ?? '')
+      .catch(recordFailure);
     log(`fetched ${activity.length} activity entries for today`);
 
     for (const recipient of config.recipients.filter((r) => r.enabled)) {
@@ -81,7 +109,7 @@ export async function runAndDeliver(
       const target = r.slackTarget || (r.slackEmail ? await slack.lookupUserByEmail(r.slackEmail) : null);
       if (!target) throw new Error(`no Slack target — set slackTarget, or an email Slack knows`);
 
-      await slack.postMessage(target, rendered.text, rendered.blocks);
+      await slack.postMessage(target, rendered.text, rendered.blocks, rendered.attachments ?? []);
       log(`${r.label}: delivered ${job} (${total} item(s)) to ${target}`);
       perRecipient.push({ id: r.id, matched: total, delivered: true, error: null });
     } catch (err) {

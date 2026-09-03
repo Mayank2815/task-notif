@@ -12,7 +12,7 @@ import type { TeamworkComment, TeamworkTask } from '../teamwork/types.js';
 
 const ME = 400001;
 const OTHER = 400002;
-const identity = buildIdentity({ id: ME, firstName: 'Priya', lastName: 'Pandey', email: 'mayankmp@example.com' }, ['PriyaS']);
+const identity = buildIdentity({ id: ME, firstName: 'Priya', lastName: 'Pandey', email: 'alice@example.com' }, ['PriyaS']);
 
 const config = ConfigSchema.parse({ timezone: 'Asia/Kolkata', includeDueToday: true });
 const NOW = DateTime.fromISO('2026-09-02T09:00', { zone: 'Asia/Kolkata' });
@@ -54,7 +54,7 @@ test('matches the atwho span markup Teamwork emits', () => {
 });
 
 test('matches by email address', () => {
-  assert.equal(mentionsIdentity(comment({ body: 'cc mayankmp@example.com' }), identity), true);
+  assert.equal(mentionsIdentity(comment({ body: 'cc alice@example.com' }), identity), true);
 });
 
 test('an empty comment matches nothing', () => {

@@ -97,6 +97,27 @@ export function mentionsIdentity(comment: { body: string; htmlBody?: string }, i
   return mentionRole(comment, identity) !== 'none';
 }
 
+/** Teamwork comments carry markdown that reads as noise once quoted in Slack. */
+export function stripMarkdown(text: string): string {
+  return text
+    // fenced code — an npm tarball listing tells the reader nothing
+    .replace(/```[\s\S]*?```/g, ' [code] ')
+    .replace(/`([^`]+)`/g, '$1')
+    // "[@Name](/app/people/123)" -> "@Name"
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(^|\s)[*_]([^*_\n]+)[*_](?=\s|$)/g, '$1$2')
+    .replace(/^\s*[-*+]\s+/gm, '• ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Teamwork appends " *" to a great many task titles; it is not part of the name. */
+export function cleanTaskName(name: string): string {
+  return name.replace(/\s*\*\s*$/, '').trim();
+}
+
 export function toPlainText(body: string): string {
   return body
     .replace(/<br\s*\/?>/gi, ' ')
@@ -113,7 +134,7 @@ export function toPlainText(body: string): string {
 }
 
 export function snippet(body: string, max = 200): string {
-  const text = toPlainText(body);
+  const text = stripMarkdown(toPlainText(body));
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 

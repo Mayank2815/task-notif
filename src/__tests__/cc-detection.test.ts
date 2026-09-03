@@ -3,7 +3,7 @@ import test from 'node:test';
 import { buildIdentity, mentionRole } from '../teamwork/identity.js';
 
 const identity = buildIdentity(
-  { id: 400001, firstName: 'Priya', lastName: 'Pandey', email: 'mayankmp@example.com' },
+  { id: 400001, firstName: 'Priya', lastName: 'Pandey', email: 'alicemp@example.com' },
   ['PriyaS'],
 );
 const role = (body: string) => mentionRole({ body, htmlBody: '' }, identity);

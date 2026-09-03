@@ -5,6 +5,13 @@ import { runAndDeliver } from '../deliver.js';
 
 const MAX_TIMEOUT_MS = 2_147_483_647; // setTimeout overflows past ~24.8 days and would fire immediately
 
+/**
+ * A laptop waking at 09:00 often has no network for the first minute or two, and a
+ * failed run used to be skipped until the next day. These delays cover roughly the
+ * first hour, which is where transient failures cluster.
+ */
+const RETRY_DELAYS_MS = [60_000, 180_000, 600_000, 1_800_000];
+
 export const JOB_KINDS: JobKind[] = ['reminder', 'digest'];
 
 export interface SchedulerDeps {
@@ -30,8 +37,12 @@ export function nextFireTime(config: Config, job: Job, from: DateTime = DateTime
   return null;
 }
 
-/** True when the job's slot has passed, is still within grace, and nothing was sent for it yet. */
-export function shouldCatchUp(config: Config, job: Job, now: DateTime, lastScheduledRunAt: string | null): boolean {
+/**
+ * True when the job's slot has passed, is still within grace, and nothing was
+ * successfully sent for it yet. `lastSuccessfulRunAt` must be a successful run —
+ * passing a failed one here would silently cancel the catch-up.
+ */
+export function shouldCatchUp(config: Config, job: Job, now: DateTime, lastSuccessfulRunAt: string | null): boolean {
   if (!config.enabled || !job.enabled) return false;
 
   const local = now.setZone(config.timezone);
@@ -42,12 +53,13 @@ export function shouldCatchUp(config: Config, job: Job, now: DateTime, lastSched
   if (local < slot) return false;
   if (local > slot.plus({ minutes: config.catchUpGraceMinutes })) return false;
 
-  if (!lastScheduledRunAt) return true;
-  return DateTime.fromISO(lastScheduledRunAt).setZone(config.timezone) < slot;
+  if (!lastSuccessfulRunAt) return true;
+  return DateTime.fromISO(lastSuccessfulRunAt).setZone(config.timezone) < slot;
 }
 
 export class Scheduler {
   private readonly timers = new Map<JobKind, NodeJS.Timeout>();
+  private readonly retryTimers = new Map<JobKind, NodeJS.Timeout>();
   private readonly running = new Set<JobKind>();
   private readonly log: (m: string) => void;
 
@@ -58,8 +70,15 @@ export class Scheduler {
   start(): void {
     const config = getConfig();
     for (const kind of JOB_KINDS) {
-      const last = getRuns().find((r) => r.trigger === 'scheduled' && r.job === kind)?.at ?? null;
+      // Any SUCCESSFUL send satisfies the slot, however it was triggered. Sending the
+      // missed reminder by hand and then restarting must not deliver it a second time.
+      // Failures are excluded: that slot is still owed.
+      const last = getRuns().find((r) => r.job === kind && r.ok)?.at ?? null;
       // A restart during a slot must not silently skip it.
+      if (process.env.SUPPRESS_CATCHUP === '1') {
+        this.log(`${kind}: catch-up suppressed by SUPPRESS_CATCHUP`);
+        continue;
+      }
       if (shouldCatchUp(config, config.jobs[kind], DateTime.now(), last)) {
         const slot = config.jobs[kind].time;
         this.log(`missed today's ${kind} slot (${slot}) while the machine was off — sending it now`);
@@ -71,7 +90,9 @@ export class Scheduler {
 
   stop(): void {
     for (const timer of this.timers.values()) clearTimeout(timer);
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.retryTimers.clear();
   }
 
   /** Call after any config change so the next fire times reflect it immediately. */
@@ -122,7 +143,11 @@ export class Scheduler {
     );
   }
 
-  async fire(kind: JobKind, note?: string): Promise<void> {
+  /**
+   * Runs the job, retrying transient failures rather than losing the day.
+   * `attempt` is 0 for the scheduled run and increments per retry.
+   */
+  async fire(kind: JobKind, note?: string, attempt = 0): Promise<void> {
     if (this.running.has(kind)) {
       this.log(`${kind}: previous run still in flight — skipping this tick`);
       return;
@@ -130,8 +155,19 @@ export class Scheduler {
     this.running.add(kind);
     try {
       await runAndDeliver(getConfig(), this.deps.teamworkToken, this.deps.slackToken, kind, 'scheduled', this.log, note);
+      if (attempt > 0) this.log(`${kind}: succeeded on retry ${attempt}`);
     } catch (err) {
-      this.log(`${kind}: run failed: ${(err as Error).message}`);
+      const message = (err as Error).message;
+      const delay = RETRY_DELAYS_MS[attempt];
+
+      if (delay === undefined) {
+        this.log(`${kind}: failed after ${RETRY_DELAYS_MS.length} retries (${message}) — giving up until the next slot`);
+        return;
+      }
+
+      this.log(`${kind}: run failed (${message}) — retry ${attempt + 1} in ${Math.round(delay / 60_000)} min`);
+      const timer = setTimeout(() => void this.fire(kind, note ?? '⏰ Late — the first attempt could not reach the network', attempt + 1), delay);
+      this.retryTimers.set(kind, timer);
     } finally {
       this.running.delete(kind);
     }

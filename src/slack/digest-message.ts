@@ -1,5 +1,6 @@
 import type { Digest } from '../digest.js';
-import { MAX_BLOCKS, renderSlackRows, type RenderedMessage } from './message.js';
+import { cleanTaskName } from '../teamwork/identity.js';
+import { MAX_BLOCKS, renderSlackRows, sectionHeading, type RenderedMessage } from './message.js';
 
 const MAX_PER_SECTION = 12;
 
@@ -49,11 +50,11 @@ export function renderDigest(digest: Digest, timezone: string, note?: string): R
 
   if (digest.updates.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*✅ Worked on / updated* · ${digest.updates.length}`);
+    blocks.push(sectionHeading(`✅ Worked on / updated · ${digest.updates.length}`));
     for (const u of digest.updates.slice(0, MAX_PER_SECTION)) {
       const tags = [u.isDone ? '`dev done`' : null, u.isBlocker ? '`blocker`' : null].filter(Boolean).join(' ');
       const prs = u.prLinks.length ? `\n🔗 ${u.prLinks.map((p, i) => link(p, u.prLinks.length > 1 ? `PR ${i + 1}` : 'PR')).join('  ')}` : '';
-      section(`*${link(u.link, u.taskName)}*${tags ? ` ${tags}` : ''}\n_${esc(u.text)}_${prs}`);
+      section(`*${link(u.link, cleanTaskName(u.taskName))}*${tags ? ` ${tags}` : ''}\n>${esc(u.text)}${prs}`);
       blocks.push({
         type: 'context',
         elements: [{ type: 'mrkdwn', text: `${u.project ? `${esc(u.project)}  ·  ` : ''}${time(u.at, timezone)}` }],
@@ -66,40 +67,41 @@ export function renderDigest(digest: Digest, timezone: string, note?: string): R
 
   if (digest.completed.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*🏁 Completed today* · ${digest.completed.length}`);
-    section(digest.completed.slice(0, MAX_PER_SECTION).map((c) => `• ${c.link ? link(c.link, c.taskName) : esc(c.taskName)}${c.project ? ` _(${esc(c.project)})_` : ''}`).join('\n'));
+    blocks.push(sectionHeading(`🏁 Completed today · ${digest.completed.length}`));
+    section(digest.completed.slice(0, MAX_PER_SECTION).map((c) => `• ${c.link ? link(c.link, cleanTaskName(c.taskName)) : esc(cleanTaskName(c.taskName))}${c.project ? ` _(${esc(c.project)})_` : ''}`).join('\n'));
   }
 
   if (digest.statusChanges.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*🔄 Other changes you made* · ${digest.statusChanges.length}`);
+    blocks.push(sectionHeading(`🔄 Other changes you made · ${digest.statusChanges.length}`));
     const lines = digest.statusChanges.slice(0, MAX_PER_SECTION).map((s) => `• ${esc(s.description)} _(${time(s.at, timezone)})_`);
     section(lines.join('\n'));
   }
 
   if (digest.newlyAssigned.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*🆕 Landed on you today* · ${digest.newlyAssigned.length}`);
-    section(digest.newlyAssigned.slice(0, MAX_PER_SECTION).map((t) => `• ${link(t.link, t.taskName)}${t.project ? ` _(${esc(t.project)})_` : ''}`).join('\n'));
+    blocks.push(sectionHeading(`🆕 Landed on you today · ${digest.newlyAssigned.length}`));
+    section(digest.newlyAssigned.slice(0, MAX_PER_SECTION).map((t) => `• ${link(t.link, cleanTaskName(t.taskName))}${t.project ? ` _(${esc(t.project)})_` : ''}`).join('\n'));
   }
 
   if (digest.mentionsOpen.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*⏳ Asked you today — not answered yet* · ${digest.mentionsOpen.length}`);
+    blocks.push(sectionHeading(`⏳ Asked you — not answered yet · ${digest.mentionsOpen.length}`));
     for (const m of digest.mentionsOpen.slice(0, MAX_PER_SECTION)) {
-      section(`${link(m.link, m.taskName)}\n👤 ${esc(m.author)} · 🕘 ${time(m.at, timezone)}\n_${esc(m.text)}_`);
+      section(`*${link(m.link, cleanTaskName(m.taskName))}*\n>${esc(m.text)}`);
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(m.author)}  ·  ${time(m.at, timezone)}` }] });
     }
   }
 
   if (digest.slackAwaiting.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*💬 Slack — awaiting your reply* · ${digest.slackAwaiting.length}`);
+    blocks.push(sectionHeading(`💬 Slack — awaiting your reply · ${digest.slackAwaiting.length}`));
     blocks.push(...renderSlackRows(digest.slackAwaiting, digest.recipient.id));
   }
 
   if (digest.slackReplied.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*✔️ Slack — you replied* · ${digest.slackReplied.length}`);
+    blocks.push(sectionHeading(`✔️ Slack — you replied · ${digest.slackReplied.length}`));
     section(digest.slackReplied.slice(0, MAX_PER_SECTION).map((m) =>
       `• ${link(m.permalink, m.isDm ? `DM from ${m.author}` : `#${m.channelName}`)} _(${esc(m.author)})_` +
       (m.acknowledgedByReaction ? ' · reacted' : '')).join('\n'));
@@ -107,8 +109,8 @@ export function renderDigest(digest: Digest, timezone: string, note?: string): R
 
   if (digest.mentionsAnswered.length > 0) {
     blocks.push({ type: 'divider' });
-    section(`*💬 Asked you today — you replied* · ${digest.mentionsAnswered.length}`);
-    section(digest.mentionsAnswered.slice(0, MAX_PER_SECTION).map((m) => `• ${link(m.link, m.taskName)} _(${esc(m.author)})_`).join('\n'));
+    blocks.push(sectionHeading(`💬 Asked you — you replied · ${digest.mentionsAnswered.length}`));
+    section(digest.mentionsAnswered.slice(0, MAX_PER_SECTION).map((m) => `• ${link(m.link, cleanTaskName(m.taskName))} _(${esc(m.author)})_`).join('\n'));
   }
 
   // The digest grows with the day; trimming the tail beats Slack rejecting the message.

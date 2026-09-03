@@ -1,4 +1,5 @@
 import type { Digest } from '../digest.js';
+import { cleanTaskName } from '../teamwork/identity.js';
 
 const NAME_MAX = 58; // long enough to recognise a ticket, short enough to keep a line scannable
 
@@ -99,7 +100,7 @@ function count(n: number, noun: string): string {
 }
 
 function trim(name: string): string {
-  const clean = name.replace(/\s*\*\s*$/, '').trim(); // Teamwork appends " *" to many titles
+  const clean = cleanTaskName(name);
   return esc(clean.length <= NAME_MAX ? clean : `${clean.slice(0, NAME_MAX - 1).trimEnd()}…`);
 }
 
