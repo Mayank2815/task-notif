@@ -8,8 +8,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.tasknotif.agent"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 NODE="$(command -v node)"
+# launchd opens these itself, before the process starts, and it has no access to
+# protected folders like Desktop or Documents — a project living there makes the
+# job fail to spawn with exit 78 and no output. ~/Library/Logs always works.
+LOGDIR="$HOME/Library/Logs/task-notif"
 
-mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/logs"
+mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR"
 
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,8 +29,8 @@ cat > "$PLIST" <<PLIST_EOF
   <key>WorkingDirectory</key><string>$ROOT</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$ROOT/logs/server.log</string>
-  <key>StandardErrorPath</key><string>$ROOT/logs/server.err.log</string>
+  <key>StandardOutPath</key><string>$LOGDIR/server.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/server.err.log</string>
 </dict>
 </plist>
 PLIST_EOF
@@ -47,10 +51,10 @@ sleep 3
 if launchctl list | grep -q "$LABEL"; then
   status=$(launchctl list | grep "$LABEL" | awk '{print $1}')
   if [ "$status" = "-" ]; then
-    echo "WARNING: $LABEL registered but is not running. Check $ROOT/logs/server.err.log"
+    echo "WARNING: $LABEL registered but is not running. Check $LOGDIR/server.err.log"
     exit 1
   fi
-  echo "Loaded $LABEL (pid $status). Logs: $ROOT/logs/server.log"
+  echo "Loaded $LABEL (pid $status). Logs: $LOGDIR/server.log"
 else
   echo "ERROR: $LABEL did not register."
   exit 1

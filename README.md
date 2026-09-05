@@ -191,11 +191,16 @@ publishing the port. If you ever do expose it, put a reverse proxy with auth in 
 ### macOS launchd gotcha
 
 If the agent registers but never runs — `launchctl list` shows `-` and exit code `78`, with
-nothing in the logs — check the log files for a `com.apple.macl` extended attribute
-(`xattr logs/server.log`). macOS stamps that on files it is protecting, and launchd then
-cannot open them to attach the job's output, so the job dies before producing a single line.
-Deleting the stale log files fixes it. `install-launchd.sh` now verifies the job is actually
-running and fails loudly rather than reporting success.
+nothing in the logs — the cause is almost always where the log files live. launchd opens
+them itself, before the process starts, and it has no access to the folders macOS protects:
+Desktop, Documents and Downloads. A checkout sitting in one of those gets its log files
+stamped with a `com.apple.macl` extended attribute (`xattr <logfile>`), launchd cannot open
+them to attach the job's output, and the job dies before producing a single line.
+
+Deleting the stale files clears it for a while, but the attribute comes back. The durable
+fix is to keep the logs outside the protected folders, so the agent writes to
+`~/Library/Logs/task-notif/` regardless of where the checkout lives. `install-launchd.sh`
+sets that up, and verifies the job is actually running rather than reporting success blindly.
 
 ## Configuration
 
