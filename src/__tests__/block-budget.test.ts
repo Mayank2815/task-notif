@@ -79,6 +79,25 @@ test('yesterday leads the morning message, today follows', () => {
   assert.match(json, /Closed 2 tasks/);
 });
 
+test('a multi-day stand-up is titled by its span, not called yesterday', () => {
+  const r = renderReminder(
+    fakeResult({ overdue: 1 }), 'Asia/Kolkata', [], undefined, '\u2022 Closed 2 tasks',
+    'Friday, 4 September \u2013 Sunday, 6 September', 3,
+  );
+  const json = JSON.stringify(r.blocks);
+  assert.match(json, /Last 3 days/);
+  assert.match(json, /Friday, 4 September/);
+  assert.ok(!json.includes('Yesterday'), 'Monday must not call three days "yesterday"');
+});
+
+test('a single-day stand-up is still called yesterday', () => {
+  const r = renderReminder(
+    fakeResult({ overdue: 1 }), 'Asia/Kolkata', [], undefined, '\u2022 Closed 2 tasks',
+    'Sunday, 6 September', 1,
+  );
+  assert.match(JSON.stringify(r.blocks), /Yesterday \u2014 Sunday, 6 September/);
+});
+
 test('with no yesterday summary the message is just today', () => {
   const json = JSON.stringify(renderReminder(fakeResult({ overdue: 1 }), 'Asia/Kolkata').blocks);
   assert.ok(!json.includes('Yesterday'));

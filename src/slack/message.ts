@@ -95,11 +95,15 @@ export function renderReminder(
   slackAwaiting: SlackMention[] = [],
   note?: string,
   yesterdaySummary: string | null = null,
+  /** The period the stand-up covers. On a Monday it spans the whole weekend. */
+  standupLabel: string | null = null,
+  standupDays = 1,
 ): RenderedMessage {
   const name = result.recipient.label || result.identity.displayName;
   const now = DateTime.now().setZone(timezone);
   const today = now.toFormat('cccc, d LLLL');
-  const yesterdayLabel = now.minus({ days: 1 }).toFormat('cccc, d LLLL');
+  const yesterdayLabel = standupLabel ?? now.minus({ days: 1 }).toFormat('cccc, d LLLL');
+  const standupTitle = standupDays > 1 ? `Last ${standupDays} days` : 'Yesterday';
 
   if (result.total === 0 && slackAwaiting.length === 0 && !yesterdaySummary) {
     return {
@@ -125,7 +129,7 @@ export function renderReminder(
 
   // Yesterday first: it is the half you read out, and stand-up comes before the day's work.
   if (yesterdaySummary) {
-    intro.push(sectionHeading(`🗣️ Yesterday — ${yesterdayLabel}`));
+    intro.push(sectionHeading(`🗣️ ${standupTitle} — ${yesterdayLabel}`));
     intro.push({ type: 'section', text: { type: 'mrkdwn', text: yesterdaySummary } });
     intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_for stand-up_' }] });
   }

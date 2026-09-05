@@ -77,22 +77,61 @@ export interface DigestWorkspace {
   activity: TeamworkActivity[];
 }
 
+/** A weekly schedule can leave at most a six-day gap, so the walk back never needs more. */
+const MAX_STANDUP_SPAN_DAYS = 7;
+
+const dayLabel = (d: DateTime): string => d.toFormat('cccc, d LLLL');
+
 /**
  * The window a digest covers, in the configured timezone.
  * `dayOffset` 0 is today so far; 1 is the whole of yesterday, which is what a
- * morning stand-up actually reports on.
+ * morning stand-up actually reports on. `spanDays` widens that backwards, so
+ * offset 1 with span 3 is the three whole days ending yesterday.
  */
 export function digestWindow(
   config: Config,
   now: DateTime = DateTime.now(),
   dayOffset = 0,
+  spanDays = 1,
 ): { start: DateTime; end: DateTime; label: string } {
   const local = now.setZone(config.timezone);
   if (dayOffset === 0) {
-    return { start: local.startOf('day'), end: local, label: local.toFormat('cccc, d LLLL') };
+    return { start: local.startOf('day'), end: local, label: dayLabel(local) };
   }
-  const day = local.minus({ days: dayOffset }).startOf('day');
-  return { start: day, end: day.endOf('day'), label: day.toFormat('cccc, d LLLL') };
+  const end = local.minus({ days: dayOffset }).startOf('day');
+  const start = end.minus({ days: Math.max(1, spanDays) - 1 });
+  return {
+    start,
+    end: end.endOf('day'),
+    label: start.hasSame(end, 'day') ? dayLabel(start) : `${dayLabel(start)} – ${dayLabel(end)}`,
+  };
+}
+
+/**
+ * What the morning stand-up should report on: everything since the previous
+ * reminder went out. Tuesday to Friday that is simply yesterday, but on Monday
+ * it is Friday, Saturday and Sunday together — otherwise Friday's work is never
+ * reported anywhere, because Monday's "yesterday" is an empty Sunday.
+ */
+export function standupWindow(
+  config: Config,
+  now: DateTime = DateTime.now(),
+): { start: DateTime; end: DateTime; days: number; label: string } {
+  const local = now.setZone(config.timezone);
+  const fireDays = config.jobs.reminder.daysOfWeek;
+
+  // Walk back from yesterday to the most recent day the reminder ran; that day
+  // starts the window, because its own message only covered up to the day before.
+  let span = 1;
+  for (let back = 1; back <= MAX_STANDUP_SPAN_DAYS; back++) {
+    if (fireDays.includes(local.minus({ days: back }).weekday)) {
+      span = back;
+      break;
+    }
+  }
+
+  const { start, end, label } = digestWindow(config, local, 1, span);
+  return { start, end, days: span, label };
 }
 
 export function extractPrLinks(text: string): string[] {
@@ -119,11 +158,12 @@ export async function buildDigest(
   dayOffset = 0,
   slackActivity: ChannelActivity[] = [],
   meetings: MeetingMention[] = [],
+  spanDays = 1,
 ): Promise<Digest> {
   const user = ws.usersById.get(recipient.teamworkUserId) ??
     (await client.person(recipient.teamworkUserId)) ?? { id: recipient.teamworkUserId };
   const identity = buildIdentity(user, recipient.handles);
-  const { start, end, label } = digestWindow(config, now, dayOffset);
+  const { start, end, label } = digestWindow(config, now, dayOffset, spanDays);
   const startIso = start.toUTC().toISO() ?? '';
   const endIso = end.toUTC().toISO() ?? '';
   const inWindow = (iso: string | null | undefined): boolean =>
