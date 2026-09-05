@@ -24,6 +24,8 @@ export interface RecipientResult {
 
 export interface ScanResult {
   results: RecipientResult[];
+  /** Reused by the caller so a second full sweep is never needed. */
+  workspace: Workspace;
   stats: {
     commentsSwept: number;
     tasksIndexed: number;
@@ -275,6 +277,7 @@ export async function runScan(config: Config, apiToken: string, log: (m: string)
 
   return {
     results,
+    workspace: ws,
     stats: { commentsSwept: ws.commentCount, tasksIndexed: ws.tasksById.size, durationMs: Date.now() - started },
   };
 }

@@ -156,7 +156,9 @@ export function buildRouter(deps: RouterDeps): Router {
       const config = only
         ? { ...base, recipients: base.recipients.map((r) => ({ ...r, enabled: r.id === only })) }
         : base;
-      const outcome = await runAndDeliver(config, deps.teamworkToken, deps.slackToken, job, 'manual');
+      // Manual sends were silent, which made diagnosing a slow run impossible.
+      const outcome = await runAndDeliver(config, deps.teamworkToken, deps.slackToken, job, 'manual',
+        (m) => console.log(`[manual] ${m}`));
       res.json({ job, perRecipient: outcome.perRecipient, scan: outcome.scan ? serialiseScan(outcome.scan) : null });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });

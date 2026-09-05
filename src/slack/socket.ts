@@ -58,6 +58,8 @@ export class SlackSocket {
   private ws: WebSocket | null = null;
   private attempts = 0;
   private stopped = false;
+  /** Guards against two connection attempts racing, which Slack counts as two sockets. */
+  private connecting = false;
 
   constructor(
     private readonly appToken: string,
@@ -76,12 +78,20 @@ export class SlackSocket {
   }
 
   private async connect(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.connecting) return;
+    this.connecting = true;
+
+    // Slack rejects extra connections with too_many_websockets, so retire the old
+    // one before asking for another.
+    if (this.ws && this.ws.readyState <= WebSocket.OPEN) {
+      try { this.ws.close(); } catch { /* already gone */ }
+    }
 
     let url: string;
     try {
       url = await this.openConnection();
     } catch (err) {
+      this.connecting = false;
       this.log(`could not open connection: ${(err as Error).message}`);
       this.scheduleReconnect();
       return;
@@ -92,6 +102,7 @@ export class SlackSocket {
 
     ws.addEventListener('open', () => {
       this.attempts = 0;
+      this.connecting = false;
       this.log('connected — dismiss buttons are live');
     });
 
@@ -100,7 +111,9 @@ export class SlackSocket {
     });
 
     ws.addEventListener('close', () => {
-      if (!this.stopped) {
+      this.connecting = false;
+      // Only the live socket may trigger a reconnect; a retired one must not.
+      if (!this.stopped && this.ws === ws) {
         this.log('disconnected');
         this.scheduleReconnect();
       }

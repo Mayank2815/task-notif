@@ -11,6 +11,8 @@ const MAX_TIMEOUT_MS = 2_147_483_647; // setTimeout overflows past ~24.8 days an
  * first hour, which is where transient failures cluster.
  */
 const RETRY_DELAYS_MS = [60_000, 180_000, 600_000, 1_800_000];
+/** A whole run should take minutes; past this something is wedged and retrying is better. */
+const RUN_TIMEOUT_MS = 12 * 60_000;
 
 export const JOB_KINDS: JobKind[] = ['reminder', 'digest'];
 
@@ -154,7 +156,14 @@ export class Scheduler {
     }
     this.running.add(kind);
     try {
-      await runAndDeliver(getConfig(), this.deps.teamworkToken, this.deps.slackToken, kind, 'scheduled', this.log, note);
+      const started = Date.now();
+      await Promise.race([
+        runAndDeliver(getConfig(), this.deps.teamworkToken, this.deps.slackToken, kind, 'scheduled', this.log, note),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`run exceeded ${RUN_TIMEOUT_MS / 60_000} minutes`)), RUN_TIMEOUT_MS),
+        ),
+      ]);
+      this.log(`${kind}: completed in ${Math.round((Date.now() - started) / 1000)}s`);
       if (attempt > 0) this.log(`${kind}: succeeded on retry ${attempt}`);
     } catch (err) {
       const message = (err as Error).message;

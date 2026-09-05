@@ -74,35 +74,43 @@ export async function runAndDeliver(
   if (job === 'reminder') {
     scan = await runScan(config, teamworkToken, log).catch(recordFailure);
 
-    // The morning message leads with yesterday, because that is what stand-up asks for.
-    const yesterdayByRecipient = new Map<string, string | null>();
-    if (config.includeYesterdayInReminder) {
-      const client = makeClient(config, teamworkToken);
-      const ws = await collectWorkspace(client, () => {}, config).catch(recordFailure);
-      const since = DateTime.now().setZone(config.timezone).minus({ days: 1 }).startOf('day').toUTC().toISO() ?? '';
-      const activity = await client.activitySince(since).catch(recordFailure);
+    // One Slack search per person covers both halves: the pending window already
+    // spans yesterday, so yesterday's mentions are filtered out of the same result
+    // rather than fetched again. Doing it twice roughly doubled a run that was
+    // already the slowest thing here.
+    const client = makeClient(config, teamworkToken);
+    const wantYesterday = config.includeYesterdayInReminder;
+    const yesterdayStart = DateTime.now().setZone(config.timezone).minus({ days: 1 }).startOf('day');
+    const yesterdayEnd = yesterdayStart.endOf('day');
 
-      for (const result of scan.results) {
-        const r = result.recipient;
-        const mentions = await slackMentionsFor(config, r.id, 'yesterday', log, names);
+    const ws = wantYesterday ? scan.workspace : null;
+    const activity = wantYesterday
+      ? await client.activitySince(yesterdayStart.toUTC().toISO() ?? '').catch(recordFailure)
+      : [];
+
+    for (const result of scan.results) {
+      const r = result.recipient;
+      const pending = await slackMentionsFor(config, r.id, 'pending', log, names);
+      const awaiting = pending.filter((m) => !m.answered);
+
+      let summary: string | null = null;
+      if (wantYesterday && ws) {
+        const mentions = pending.filter((m) => {
+          const at = DateTime.fromISO(m.at);
+          return at >= yesterdayStart && at <= yesterdayEnd;
+        });
         const { activity: slackActivity, meetings } = await slackDayFor(config, r.id, 1, log, names);
         const digest = await buildDigest(
           client, { ...ws, activity }, config, r, DateTime.now(), mentions, 1, slackActivity, meetings,
         );
-        const summary = await writeStandupSummary(digest, config, (m) => log(`${r.label}: ${m}`));
+        summary = await writeStandupSummary(digest, config, (m) => log(`${r.label}: ${m}`));
         log(`${r.label}: yesterday — ${digest.updates.length} worked on, ${digest.completed.length} closed, ${slackActivity.length} conversations, ${meetings.length} calls`);
-        yesterdayByRecipient.set(r.id, summary);
       }
-    }
 
-    for (const result of scan.results) {
-      const awaiting = (await slackMentionsFor(config, result.recipient.id, 'pending', log, names)).filter((m) => !m.answered);
       messages.push({
-        recipient: result.recipient,
+        recipient: r,
         total: result.total + awaiting.length,
-        rendered: renderReminder(
-          result, config.timezone, awaiting, note, yesterdayByRecipient.get(result.recipient.id) ?? null,
-        ),
+        rendered: renderReminder(result, config.timezone, awaiting, note, summary),
       });
     }
   } else {
