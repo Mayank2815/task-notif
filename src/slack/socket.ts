@@ -3,6 +3,7 @@ import {
 } from '../config/store.js';
 import { TeamworkClient } from '../teamwork/client.js';
 import { PeopleDirectory } from '../teamwork/people-directory.js';
+import { cleanTaskName } from '../teamwork/identity.js';
 import { toTeamworkHtml } from './rich-text.js';
 import { envKeyFor } from './mentions.js';
 import { DateTime } from 'luxon';
@@ -17,6 +18,8 @@ const DISMISS_ACTIONS = new Set(['dismiss_thread', 'dismiss_task']);
 export const UNDO_ACTION = 'undo_dismiss';
 
 const RECONNECT_BASE_MS = 1000;
+/** Slack honours a response_url for thirty minutes; a minute of margin avoids a failed rewrite. */
+const RESPONSE_URL_LIFE_MS = 29 * 60_000;
 const RECONNECT_MAX_MS = 60_000;
 
 interface Envelope {
@@ -82,7 +85,7 @@ export function muteRow(
   const out = [...blocks];
   const removed = out.splice(row.index, row.count, undoableNote(label, actionValue));
 
-  return { blocks: out.map((block) => shiftHeader(block, -1)), removed };
+  return { blocks: adjustCounts(out, row.index, -1), removed };
 }
 
 /**
@@ -119,30 +122,63 @@ function findRow(blocks: Record<string, unknown>[], actionValue: string): { inde
 const shortDate = (iso: string) => DateTime.fromISO(iso).toFormat('ccc d LLL');
 
 /**
- * Notes a moved due date on the row and leaves its controls in place, with the picker
- * now showing the new date — a wrong pick is fixed by picking again, not in Teamwork.
- * The row stays until the next reminder, which will no longer count it as overdue.
+ * Rewrites a row after its due date moved.
+ *
+ * Moved past today, the task is no longer overdue or due today, so it leaves that
+ * section: the row becomes a one-line note, the counts drop, and a date picker stays on
+ * the note so a wrong pick is fixed by picking again rather than in Teamwork. Moved to
+ * today it still belongs where it is, so the row only notes the change.
  */
 export function markRowMoved(
-  blocks: Record<string, unknown>[], rowId: string, date: string,
+  blocks: Record<string, unknown>[], rowId: string, date: string, today: string,
 ): Record<string, unknown>[] | null {
+  const label = rowId.split('|')[2] ?? 'that task';
+  const note = (d: string) => ({
+    type: 'section',
+    block_id: rowId,
+    text: {
+      type: 'mrkdwn',
+      text: d > today
+        ? `📅 *${label}* — moved to ${shortDate(d)}, off the overdue list`
+        : `📅 *${label}* — moved to today`,
+    },
+    accessory: {
+      type: 'datepicker',
+      action_id: DUE_ACTION,
+      initial_date: d,
+      placeholder: { type: 'plain_text', text: '📅 Move due date' },
+    },
+  });
+
+  // Picked again on a row that already left: only the note changes.
+  const noted = blocks.findIndex((b) => b.type === 'section' && b.block_id === rowId);
+  if (noted !== -1) {
+    const out = [...blocks];
+    out[noted] = note(date);
+    return out;
+  }
+
   const at = blocks.findIndex((b) => b.type === 'actions' && b.block_id === rowId);
   if (at <= 0 || blocks[at - 1]?.type !== 'section') return null;
 
+  if (date > today) {
+    const out = [...blocks];
+    out.splice(at - 1, 2, note(date));
+    return adjustCounts(out, at - 1, -1);
+  }
+
+  // Still due today: the row stays, marked, with the picker showing the new date.
   const out = [...blocks];
   const section = out[at - 1]!;
   const current = String((section.text as { text?: string } | undefined)?.text ?? '');
-  // Replace an earlier note rather than stacking one per pick.
-  const note = `📅 _moved to ${shortDate(date)}_`;
+  const mark = `📅 _moved to ${shortDate(date)}_`;
   const text = /\n📅 _moved to [^_]*_$/.test(current)
-    ? current.replace(/\n📅 _moved to [^_]*_$/, `\n${note}`)
-    : `${current}\n${note}`;
+    ? current.replace(/\n📅 _moved to [^_]*_$/, `\n${mark}`)
+    : `${current}\n${mark}`;
   out[at - 1] = { ...section, text: { type: 'mrkdwn', text } };
-
-  const actions = out[at]!;
   out[at] = {
-    ...actions,
-    elements: ((actions.elements as Record<string, unknown>[]) ?? []).map((e) =>
+    ...out[at]!,
+    elements: ((out[at]!.elements as Record<string, unknown>[]) ?? []).map((e) =>
       e.type === 'datepicker' ? { ...e, initial_date: date } : e),
   };
   return out;
@@ -159,6 +195,41 @@ export function markRowCompleted(
     type: 'context',
     elements: [{ type: 'mrkdwn', text: `✅ Completed in Teamwork — ${label || 'that task'}` }],
   });
+  return adjustCounts(out, row.index, -1);
+}
+
+/**
+ * Rewrites a row once a reply has been posted, so nobody has to open the thread again to
+ * check whether they already answered it.
+ *
+ * A row that was asking for a reply has been answered, so it leaves its section and the
+ * counts drop. An overdue row is still overdue however much is said on it, so it stays
+ * and is only marked.
+ */
+export function markRowReplied(
+  blocks: Record<string, unknown>[], key: string, notified: string[],
+): Record<string, unknown>[] | null {
+  const row = findRow(blocks, key);
+  if (!row) return null;
+  const label = key.split('|')[2] || 'that task';
+  const who = notified.length ? ` · ${notified.join(', ')} notified` : '';
+
+  const actions = blocks[row.index + 1];
+  const isOverdueRow = actions?.type === 'actions'
+    && ((actions.elements as Record<string, unknown>[]) ?? []).some((e) => e.type === 'datepicker');
+
+  const out = [...blocks];
+  if (!isOverdueRow) {
+    out.splice(row.index, row.count, {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `💬 Replied — ${label}${who}` }],
+    });
+    return adjustCounts(out, row.index, -1);
+  }
+
+  const section = out[row.index]!;
+  const current = String((section.text as { text?: string } | undefined)?.text ?? '').replace(/\n💬 _you replied[^_]*_$/, '');
+  out[row.index] = { ...section, text: { type: 'mrkdwn', text: `${current}\n💬 _you replied${who}_` } };
   return out;
 }
 
@@ -177,7 +248,7 @@ export function restoreRow(
 
   const out = [...blocks];
   out.splice(index, 1, ...removed);
-  return out.map((block) => shiftHeader(block, 1));
+  return adjustCounts(out, index, 1);
 }
 
 /**
@@ -198,16 +269,60 @@ export function stripUndoButton(
   return out;
 }
 
-/** "*💬 Slack — still unanswered* · 5" becomes "· 4" once a row is muted, and back on undo. */
-function shiftHeader(block: Record<string, unknown>, by: number): Record<string, unknown> {
-  const text = (block.text as Record<string, unknown> | undefined)?.text;
-  if (block.type !== 'section' || typeof text !== 'string') return block;
+/** A section heading carrying a count: "💬  *Awaiting my response*  ·  2". */
+const GROUP_COUNT = /^(.*\*([^*\n]+)\*)(\s+·\s+)(\d+)$/;
+/** The top-line total: "📋 Needs you today · 13". */
+const TOTAL_COUNT = /^(📋 Needs you today · )(\d+)$/;
+/** Which phrase in the tally line ("💬 2 to reply   ⏰ 11 overdue") belongs to a heading. */
+const TALLY_PHRASE: [RegExp, string][] = [
+  [/awaiting/i, 'to reply'], [/requested/i, 'asked of you'], [/overdue/i, 'overdue'], [/slack/i, 'slack'],
+];
 
-  const match = /^(\*💬 Slack[^*]*\*) · (\d+)$/.exec(text);
-  if (!match) return block;
+/**
+ * Keeps every count in the message honest when a row leaves or returns: the heading of
+ * the section it sits in, the "Needs you today" total, and the tally line under it.
+ *
+ * The heading is found by walking up from the row, so this works for any section. The
+ * helper it replaces matched only an older heading format that the message no longer
+ * uses, which meant no count ever went down.
+ */
+export function adjustCounts(
+  blocks: Record<string, unknown>[], rowIndex: number, by: number,
+): Record<string, unknown>[] {
+  const out = [...blocks];
+  const textOf = (b: Record<string, unknown>) => String((b.text as { text?: string } | undefined)?.text ?? '');
+  const bump = (n: string) => String(Math.max(0, Number(n) + by));
 
-  const next = Math.max(0, Number(match[2]) + by);
-  return { ...block, text: { type: 'mrkdwn', text: `${match[1]} · ${next}` } };
+  let label = '';
+  for (let i = Math.min(rowIndex, out.length) - 1; i >= 0; i--) {
+    const b = out[i]!;
+    if (b.type !== 'section') continue;
+    const m = GROUP_COUNT.exec(textOf(b));
+    if (!m) continue;
+    label = m[2]!;
+    out[i] = { ...b, text: { type: 'mrkdwn', text: `${m[1]}${m[3]}${bump(m[4]!)}` } };
+    break;
+  }
+
+  const phrase = TALLY_PHRASE.find(([test]) => test.test(label))?.[1];
+  for (let i = 0; i < out.length; i++) {
+    const b = out[i]!;
+    const total = b.type === 'header' ? TOTAL_COUNT.exec(textOf(b)) : null;
+    if (total) {
+      out[i] = { ...b, text: { type: 'plain_text', text: `${total[1]}${bump(total[2]!)}`, emoji: true } };
+      continue;
+    }
+    // The tally is a context line right under the total; only the phrase for this section moves.
+    if (phrase && b.type === 'context') {
+      const el = (b.elements as { type: string; text?: string }[] | undefined)?.[0];
+      const re = new RegExp(`(\\d+) ${phrase}(?=\\s|$)`);
+      if (el?.text && re.test(el.text)) {
+        const text = el.text.replace(re, (_all, n: string) => `${bump(n)} ${phrase}`);
+        out[i] = { ...b, elements: [{ ...el, text }] };
+      }
+    }
+  }
+  return out;
 }
 
 export type RoutedAction = {
@@ -264,6 +379,14 @@ export class SlackSocket {
   private connecting = false;
   /** Turns a Slack tag into the Teamwork person it means. Cached for an hour. */
   private readonly people: PeopleDirectory;
+  /**
+   * The newest copy of each reminder someone has interacted with, and a way to rewrite
+   * it. A modal is submitted long after the click that opened it, and its payload says
+   * nothing about the message — this is how a reply can still tick off its row. Kept
+   * only as long as Slack honours a response_url, and only in memory: lost on a restart,
+   * the reply is still posted and confirmed; only the row stays as it was.
+   */
+  private readonly messages = new Map<string, { blocks: Record<string, unknown>[]; responseUrl: string; at: number }>();
 
   constructor(
     private readonly appToken: string,
@@ -404,15 +527,17 @@ export class SlackSocket {
     // they do not expire, so the button can be removed however long the agent was down.
     const channel = String((payload.channel as Record<string, unknown> | undefined)?.id ?? '');
     const ts = String(message?.ts ?? '');
+    const msgKey = channel && ts ? `${channel}:${ts}` : '';
+    if (msgKey && blocks && responseUrl) this.messages.set(msgKey, { blocks, responseUrl, at: Date.now() });
 
     for (const action of actions) {
       const routed = routeAction(action);
       if (!routed) continue;
 
       if (routed.kind === 'reply') {
-        await this.reply(routed, payload);
+        await this.reply(routed, payload, msgKey);
       } else if (routed.kind === 'complete' || routed.kind === 'due') {
-        await this.changeTask(routed, blocks, responseUrl);
+        await this.changeTask(routed, blocks, responseUrl, msgKey);
       } else if (routed.kind === 'dismiss') {
         await this.dismiss({ ...routed, blocks, responseUrl, channel, ts });
       } else {
@@ -504,7 +629,7 @@ export class SlackSocket {
    * than that, so a placeholder view opens immediately and is filled in once the comment
    * arrives. Without that the modal would simply never appear on a slow call.
    */
-  private async reply(routed: RoutedAction, payload: Record<string, unknown>): Promise<void> {
+  private async reply(routed: RoutedAction, payload: Record<string, unknown>, msgKey = ''): Promise<void> {
     const triggerId = String(payload.trigger_id ?? '');
     if (!triggerId) { this.log('reply ignored: no trigger_id'); return; }
     if (!this.botToken) { this.log('reply ignored: the socket has no bot token to open a view with'); return; }
@@ -534,6 +659,7 @@ export class SlackSocket {
           total: read.total,
           handles: config.recipients.find((r) => r.id === routed.recipientId)?.handles ?? [],
           now: DateTime.now().setZone(config.timezone),
+          origin: msgKey ? { msgKey, rowKey: routed.value } : undefined,
         },
       ),
     });
@@ -566,7 +692,8 @@ export class SlackSocket {
       ].filter(Boolean).join('  ·  ');
 
       return {
-        task: { id: taskId, name: task?.name ?? '', link: task?.url, meta: meta || undefined },
+        // Teamwork appends " *" to some titles, which closed the confirmation's bold early.
+        task: { id: taskId, name: cleanTaskName(task?.name ?? ''), link: task?.url, meta: meta || undefined },
         total: ordered.length,
         thread: ordered.slice(-THREAD_SHOWN).map((c) => {
           const who = c.authorId ? authors.get(c.authorId) : undefined;
@@ -587,7 +714,7 @@ export class SlackSocket {
    * again rather than needing Teamwork to fix.
    */
   private async changeTask(
-    routed: RoutedAction, blocks: Record<string, unknown>[] | null, responseUrl: string | null,
+    routed: RoutedAction, blocks: Record<string, unknown>[] | null, responseUrl: string | null, msgKey = '',
   ): Promise<void> {
     const taskId = Number(routed.key.replace('task:', ''));
     const say = (text: string) => responseUrl
@@ -620,11 +747,11 @@ export class SlackSocket {
 
     const updated = blocks
       ? routed.kind === 'due'
-        ? markRowMoved(blocks, routed.value, routed.date!)
+        ? markRowMoved(blocks, routed.value, routed.date!, DateTime.now().setZone(config.timezone).toISODate() ?? '')
         : markRowCompleted(blocks, routed.value, routed.label)
       : null;
     if (updated && responseUrl) {
-      await this.post(responseUrl, { replace_original: true, text: 'Reminder updated', blocks: updated });
+      await this.rewrite(msgKey, responseUrl, updated);
     } else {
       await say(routed.kind === 'due' ? `📅 Moved to ${routed.date}.` : '✅ Completed in Teamwork.');
     }
@@ -652,20 +779,22 @@ export class SlackSocket {
     const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: token });
     const done: string[] = [];
     let skipped: string[] = [];
+    let notified: string[] = [];
     try {
       if (sub.rich) {
         if (sub.mentions.length) await this.people.load();
         const { html, notify, unresolved } = toTeamworkHtml(sub.rich, this.people.resolve, this.people.slackName);
         skipped = unresolved;
         await client.postComment(sub.taskId, html, { html: true, notify });
-        const tagged = sub.mentions.map((id) => this.people.resolve(id)?.name).filter(Boolean);
-        done.push(tagged.length ? `reply posted, ${tagged.join(', ')} notified` : 'reply posted');
+        notified = sub.mentions.map((id) => this.people.resolve(id)?.name).filter((n): n is string => Boolean(n));
+        done.push(notified.length ? `reply posted, ${notified.join(', ')} notified` : 'reply posted');
       }
       if (sub.complete) {
         await client.completeTask(sub.taskId);
         done.push('marked complete');
       }
       this.log(`${sub.recipientId} on task ${sub.taskId}: ${done.join(', ')}`);
+      await this.tickOffRow(sub, notified);
       const note = skipped.length
         ? `\n_Not in Teamwork, so not tagged: ${skipped.join(', ')}._`
         : '';
@@ -675,6 +804,26 @@ export class SlackSocket {
       this.log(`${sub.recipientId} on task ${sub.taskId}: ${step} failed — ${(err as Error).message}`);
       await tell(describeOutcome(sub.taskName, done, { step, reason: (err as Error).message }));
     }
+  }
+
+  /**
+   * Updates the reminder the reply came from: an answered question leaves its section, a
+   * completed task leaves the message. Silent when the message is no longer reachable —
+   * the confirmation already said what happened.
+   */
+  private async tickOffRow(sub: Submission, notified: string[]): Promise<void> {
+    const origin = sub.origin;
+    const entry = origin ? this.messages.get(origin.msgKey) : undefined;
+    // Slack stops honouring a response_url after thirty minutes; stay inside it.
+    if (!origin || !entry || Date.now() - entry.at > RESPONSE_URL_LIFE_MS) return;
+
+    let blocks: Record<string, unknown>[] | null = entry.blocks;
+    if (sub.complete) {
+      blocks = markRowCompleted(blocks, origin.rowKey, origin.rowKey.split('|')[2] ?? '');
+    } else if (sub.rich) {
+      blocks = markRowReplied(blocks, origin.rowKey, notified);
+    }
+    if (blocks) await this.rewrite(origin.msgKey, entry.responseUrl, blocks);
   }
 
   /** This person's own Teamwork token, from the environment first, then the store. */
@@ -707,6 +856,12 @@ export class SlackSocket {
       this.log(`${method} failed: ${(err as Error).message}`);
       return null;
     }
+  }
+
+  /** Rewrites a reminder in place and keeps our copy of it current. */
+  private async rewrite(msgKey: string, responseUrl: string, blocks: Record<string, unknown>[]): Promise<void> {
+    await this.post(responseUrl, { replace_original: true, text: 'Reminder updated', blocks });
+    if (msgKey) this.messages.set(msgKey, { blocks, responseUrl, at: this.messages.get(msgKey)?.at ?? Date.now() });
   }
 
   private async post(url: string, body: unknown): Promise<void> {

@@ -187,7 +187,13 @@ export function replyView(
   /** Oldest first. */
   thread: ThreadComment[],
   canPost: boolean,
-  opts: { total?: number; handles?: string[]; now?: DateTime } = {},
+  opts: {
+    total?: number;
+    handles?: string[];
+    now?: DateTime;
+    /** The reminder and row this was opened from, so saving can tick the row off. */
+    origin?: { msgKey: string; rowKey: string };
+  } = {},
 ): Record<string, unknown> {
   const now = opts.now ?? DateTime.now();
   const total = opts.total ?? thread.length;
@@ -269,7 +275,8 @@ export function replyView(
   return {
     type: 'modal',
     callback_id: REPLY_CALLBACK,
-    private_metadata: JSON.stringify({ recipientId, taskId: task.id, taskName: task.name }),
+    // Slack caps private_metadata at 3000 characters; ids and a short row key fit easily.
+    private_metadata: JSON.stringify({ recipientId, taskId: task.id, taskName: task.name, origin: opts.origin }),
     title: { type: 'plain_text', text: 'Reply to a task' },
     ...(canPost ? { submit: { type: 'plain_text', text: 'Save' } } : {}),
     close: { type: 'plain_text', text: 'Close' },
@@ -288,11 +295,13 @@ export interface Submission {
   /** Slack ids of everyone they tagged, in order. */
   mentions: string[];
   complete: boolean;
+  /** Where it was opened from, when known. */
+  origin?: { msgKey: string; rowKey: string };
 }
 
 /** What the submitted view carries back: who, which task, and what they asked for. */
 export function readSubmission(view: Record<string, unknown>): Submission | null {
-  let meta: { recipientId?: string; taskId?: number; taskName?: string };
+  let meta: { recipientId?: string; taskId?: number; taskName?: string; origin?: { msgKey: string; rowKey: string } };
   try {
     meta = JSON.parse(String(view.private_metadata ?? '{}'));
   } catch {
@@ -316,6 +325,7 @@ export function readSubmission(view: Record<string, unknown>): Submission | null
     mentions,
     complete: (values[COMPLETE_BLOCK]?.[COMPLETE_INPUT_ACTION]?.selected_options ?? [])
       .some((o) => o.value === 'complete'),
+    origin: meta.origin?.msgKey && meta.origin?.rowKey ? meta.origin : undefined,
   };
 }
 

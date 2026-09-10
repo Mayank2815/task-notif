@@ -108,19 +108,18 @@ const rowWithControls = (): Record<string, unknown>[] => [
   taskActions('alice', 5100002, 'Layout glitch', { canAct: true, kind: 'update', dueDate: '2026-09-08' }),
 ];
 
-test('a moved date is noted on the row and the controls stay for another pick', () => {
-  const out = markRowMoved(rowWithControls(), KEY, '2026-09-15')!;
-  assert.match(JSON.stringify(out[0]), /moved to Tue 15 Sep/);
-  assert.equal(elements(out[1]!)[0]!.initial_date, '2026-09-15');
+test('a date moved to today is noted on the row and the controls stay', () => {
+  const out = markRowMoved(rowWithControls(), KEY, '2026-09-11', '2026-09-11')!;
+  assert.match(JSON.stringify(out[0]), /moved to Fri 11 Sep/);
+  assert.equal(elements(out[1]!)[0]!.initial_date, '2026-09-11');
   assert.equal(out.length, 4, 'nothing is removed');
 });
 
-test('picking again replaces the note instead of stacking another', () => {
-  const once = markRowMoved(rowWithControls(), KEY, '2026-09-15')!;
-  const twice = markRowMoved(once, KEY, '2026-09-18')!;
-  const text = JSON.stringify(twice[0]);
-  assert.match(text, /moved to Fri 18 Sep/);
-  assert.ok(!text.includes('15 Sep'));
+test('moving it later takes the row out; the rest of the message is untouched', () => {
+  const out = markRowMoved(rowWithControls(), KEY, '2026-09-18', '2026-09-11')!;
+  assert.equal(out.length, 3);
+  assert.match(JSON.stringify(out[0]), /off the overdue list/);
+  assert.equal(elements(out[2]!).length, 4);
 });
 
 test('a completed task leaves the message with a line saying so', () => {
@@ -226,6 +225,15 @@ const submitted = (body: string, complete: boolean) => ({
     [REPLY_INPUT_BLOCK]: { [REPLY_INPUT_ACTION]: { rich_text_value: richOf(body) } },
     [COMPLETE_BLOCK]: { [COMPLETE_INPUT_ACTION]: { selected_options: complete ? [{ value: 'complete' }] : [] } },
   } },
+});
+
+test('the row a modal was opened from survives the round trip', () => {
+  const view = replyView('alice', task, thread, true, { now, origin: { msgKey: 'D1:1788.1', rowKey: KEY } });
+  const back = readSubmission({ ...view, state: { values: {
+    [REPLY_INPUT_BLOCK]: { [REPLY_INPUT_ACTION]: { rich_text_value: { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: 'ok' }] }] } } },
+  } } })!;
+  assert.deepEqual(back.origin, { msgKey: 'D1:1788.1', rowKey: KEY });
+  assert.ok(String(view.private_metadata).length < 3000, 'Slack caps private_metadata at 3000');
 });
 
 test('a submission carries the reply and whether to complete', () => {
