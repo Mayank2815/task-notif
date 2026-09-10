@@ -22,33 +22,38 @@ const blocks = (): Record<string, unknown>[] => [
   { type: 'context', elements: [{ type: 'mrkdwn', text: 'Arjun Rao · 2026-09-02' }] },
 ];
 
-test('the finished row loses its button', () => {
-  const out = muteRow(blocks(), VALUE, '#team_workflow_dev')!;
-  assert.ok(out.every((b) => (b.accessory as { value?: string } | undefined)?.value !== VALUE));
+test('the finished row loses its Mute button', () => {
+  const out = muteRow(blocks(), VALUE, '#team_workflow_dev')!.blocks;
+  const stillMutable = out.filter(
+    (b) => (b.accessory as { action_id?: string } | undefined)?.action_id === 'dismiss_thread'
+      && (b.accessory as { value?: string }).value === VALUE,
+  );
+  assert.equal(stillMutable.length, 0);
 });
 
 test('it is replaced by a done note, not deleted silently', () => {
-  const out = muteRow(blocks(), VALUE, 'this thread in #team_workflow_dev')!;
+  const out = muteRow(blocks(), VALUE, 'this thread in #team_workflow_dev')!.blocks;
   const note = out.find((b) => JSON.stringify(b).includes('Done'));
   assert.ok(note);
-  assert.equal(note!.type, 'context');
+  // A section, not a context block, because it has to carry the Undo button.
+  assert.equal(note!.type, 'section');
 });
 
 test('the row metadata line goes with it — two blocks become one', () => {
   const before = blocks();
-  const out = muteRow(before, VALUE, '#chan')!;
+  const out = muteRow(before, VALUE, '#chan')!.blocks;
   assert.equal(out.length, before.length - 1);
   assert.ok(!JSON.stringify(out).includes('Dev Kapoor'));
 });
 
 test('other rows keep their buttons', () => {
-  const out = muteRow(blocks(), VALUE, '#chan')!;
+  const out = muteRow(blocks(), VALUE, '#chan')!.blocks;
   const remaining = out.filter((b) => (b.accessory as { action_id?: string } | undefined)?.action_id === 'dismiss_thread');
   assert.equal(remaining.length, 1);
 });
 
 test('the section count is decremented so the header stays honest', () => {
-  const out = muteRow(blocks(), VALUE, '#chan')!;
+  const out = muteRow(blocks(), VALUE, '#chan')!.blocks;
   const header = out.find((b) => String((b.text as { text?: string } | undefined)?.text ?? '').includes('Slack — still unanswered'));
   assert.match(String((header!.text as { text: string }).text), /· 4$/);
 });
@@ -58,16 +63,16 @@ test('an unknown value changes nothing and reports it', () => {
 });
 
 test('the note names the thread, not just the channel', () => {
-  const out = muteRow(blocks(), VALUE, 'this thread in #team_workflow_dev')!;
+  const out = muteRow(blocks(), VALUE, 'this thread in #team_workflow_dev')!.blocks;
   const note = out.find((b) => JSON.stringify(b).includes('Done'))!;
   assert.match(JSON.stringify(note), /this thread in/);
 });
 
 test('a row with no trailing context block still resolves cleanly', () => {
   const minimal: Record<string, unknown>[] = [
-    { type: 'section', text: { type: 'mrkdwn', text: 'x' }, accessory: { value: VALUE } },
+    { type: 'section', text: { type: 'mrkdwn', text: 'x' }, accessory: { action_id: 'dismiss_thread', value: VALUE } },
   ];
-  const out = muteRow(minimal, VALUE, '#chan')!;
+  const out = muteRow(minimal, VALUE, '#chan')!.blocks;
   assert.equal(out.length, 1);
-  assert.equal(out[0]!.type, 'context');
+  assert.equal(out[0]!.type, 'section');
 });

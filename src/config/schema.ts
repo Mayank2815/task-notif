@@ -66,6 +66,12 @@ export const ConfigSchema = z.object({
    * Scheduled runs are unaffected. A guard for testing against live people.
    */
   manualSendOnlyTo: z.string().default(''),
+  /**
+   * How long a Done press can be taken back. Pressing Done has no time limit, so an
+   * Undo that silently stopped working would read as broken — the button is removed
+   * from the message once this expires, rather than left there refusing.
+   */
+  undoWindowMinutes: z.number().int().min(1).max(1440).default(15),
 
   lookbackDays: z.number().int().min(1).max(365).default(30),
   /**
@@ -125,6 +131,29 @@ export const RunRecordSchema = z.object({
 
 export type RunRecord = z.infer<typeof RunRecordSchema>;
 
+/** The blocks lifted out of a message when a row was dismissed, so Undo can restore them. */
+export const UndoStateSchema = z.object({
+  /**
+   * The original blocks, in order, that the Done note replaced. The note is found by
+   * its button value when restoring, not by a stored position, so a row dismissed in
+   * between cannot put this one back in the wrong place.
+   */
+  blocks: z.array(z.record(z.unknown())),
+  /**
+   * The whole message as it now stands. chat.update has to be given every block, and
+   * the bot token cannot read a DM back, so the only copy is the one kept here. Every
+   * pending undo on the same message carries the same snapshot and they are refreshed
+   * together; all of it is dropped when the window closes, so this is short-lived.
+   */
+  message: z.array(z.record(z.unknown())),
+  /** chat.update needs both, and unlike a response_url they never expire. */
+  channel: z.string(),
+  ts: z.string(),
+  expiresAt: z.string(),
+});
+
+export type UndoState = z.infer<typeof UndoStateSchema>;
+
 /** A Slack thread a recipient has dismissed from their reminders. */
 export const DismissalSchema = z.object({
   recipientId: z.string(),
@@ -132,6 +161,12 @@ export const DismissalSchema = z.object({
   key: z.string(),
   at: z.string(),
   label: z.string().default(''),
+  /**
+   * Everything needed to put the row back exactly as it was, plus where to find the
+   * message so the Undo button can be removed once the window closes. Dropped the
+   * moment it expires or is used, so the store does not carry message blocks forever.
+   */
+  undo: UndoStateSchema.optional(),
 });
 
 export type Dismissal = z.infer<typeof DismissalSchema>;

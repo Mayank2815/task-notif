@@ -1,4 +1,10 @@
-import { addDismissal } from '../config/store.js';
+import {
+  addDismissal, clearUndo, getConfig, getDismissals, removeDismissal, syncUndoMessage,
+} from '../config/store.js';
+
+/** The action ids that mark something done; both are undone the same way. */
+const DISMISS_ACTIONS = new Set(['dismiss_thread', 'dismiss_task']);
+export const UNDO_ACTION = 'undo_dismiss';
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60_000;
@@ -10,18 +16,57 @@ interface Envelope {
   reason?: string;
 }
 
+export interface MuteResult {
+  /** The rewritten message. */
+  blocks: Record<string, unknown>[];
+  /** What was lifted out, kept verbatim so Undo can put the row back as it was. */
+  removed: Record<string, unknown>[];
+}
+
+/** The note that stands in for a dismissed row once its undo window has closed. */
+function doneNote(label: string): Record<string, unknown> {
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `✅ Done — ${label || 'that thread'} won't appear again` }],
+  };
+}
+
+/**
+ * The same note while undo is still possible. A section rather than a context block
+ * because only a section can carry a button, and it must stay one block either way —
+ * the message is already budgeted against Slack's fifty-block ceiling.
+ */
+function undoableNote(label: string, actionValue: string): Record<string, unknown> {
+  return {
+    type: 'section',
+    text: { type: 'mrkdwn', text: `✅ Done — ${label || 'that thread'} won't appear again` },
+    accessory: {
+      type: 'button',
+      action_id: UNDO_ACTION,
+      text: { type: 'plain_text', text: '↩︎ Undo', emoji: true },
+      value: actionValue,
+    },
+  };
+}
+
+const valueOf = (b: Record<string, unknown>): string =>
+  String((b.accessory as Record<string, unknown> | undefined)?.value ?? '');
+const actionOf = (b: Record<string, unknown>): string =>
+  String((b.accessory as Record<string, unknown> | undefined)?.action_id ?? '');
+
 /**
  * Replaces a finished thread's two blocks (its section and the metadata under it) with a
  * single note, and decrements the section's count so the header stays honest.
+ *
+ * Only a row that still carries a dismiss button matches, so Slack re-delivering the
+ * same click cannot mute the note that replaced it.
  */
 export function muteRow(
   blocks: Record<string, unknown>[],
   actionValue: string,
   label: string,
-): Record<string, unknown>[] | null {
-  const index = blocks.findIndex(
-    (b) => ((b.accessory as Record<string, unknown> | undefined)?.value ?? '') === actionValue,
-  );
+): MuteResult | null {
+  const index = blocks.findIndex((b) => valueOf(b) === actionValue && DISMISS_ACTIONS.has(actionOf(b)));
   if (index === -1) return null;
 
   // The metadata context block directly beneath belongs to this row.
@@ -29,23 +74,56 @@ export function muteRow(
   const removeCount = trailing?.type === 'context' ? 2 : 1;
 
   const out = [...blocks];
-  out.splice(index, removeCount, {
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text: `✅ Done — ${label || 'that thread'} won't appear again` }],
-  });
+  const removed = out.splice(index, removeCount, undoableNote(label, actionValue));
 
-  return out.map((block) => decrementHeader(block));
+  return { blocks: out.map((block) => shiftHeader(block, -1)), removed };
 }
 
-/** "*💬 Slack — still unanswered* · 5" becomes "· 4" once a row is muted. */
-function decrementHeader(block: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Puts a dismissed row back where it was, button and metadata intact, and restores the
+ * count muting took off. Finding the note rather than trusting a stored position keeps
+ * this correct when another row was dismissed in between.
+ */
+export function restoreRow(
+  blocks: Record<string, unknown>[],
+  actionValue: string,
+  removed: Record<string, unknown>[],
+): Record<string, unknown>[] | null {
+  const index = blocks.findIndex((b) => valueOf(b) === actionValue && actionOf(b) === UNDO_ACTION);
+  if (index === -1 || removed.length === 0) return null;
+
+  const out = [...blocks];
+  out.splice(index, 1, ...removed);
+  return out.map((block) => shiftHeader(block, 1));
+}
+
+/**
+ * Drops the Undo button once the window closes, leaving the plain note behind. The
+ * button is removed rather than left there refusing, because pressing Done has no time
+ * limit and a button that quietly stopped working would read as broken.
+ */
+export function stripUndoButton(
+  blocks: Record<string, unknown>[],
+  actionValue: string,
+  label: string,
+): Record<string, unknown>[] | null {
+  const index = blocks.findIndex((b) => valueOf(b) === actionValue && actionOf(b) === UNDO_ACTION);
+  if (index === -1) return null;
+
+  const out = [...blocks];
+  out.splice(index, 1, doneNote(label));
+  return out;
+}
+
+/** "*💬 Slack — still unanswered* · 5" becomes "· 4" once a row is muted, and back on undo. */
+function shiftHeader(block: Record<string, unknown>, by: number): Record<string, unknown> {
   const text = (block.text as Record<string, unknown> | undefined)?.text;
   if (block.type !== 'section' || typeof text !== 'string') return block;
 
   const match = /^(\*💬 Slack[^*]*\*) · (\d+)$/.exec(text);
   if (!match) return block;
 
-  const next = Math.max(0, Number(match[2]) - 1);
+  const next = Math.max(0, Number(match[2]) + by);
   return { ...block, text: { type: 'mrkdwn', text: `${match[1]} · ${next}` } };
 }
 
@@ -170,38 +248,108 @@ export class SlackSocket {
 
     const actions = (payload.actions ?? []) as Record<string, unknown>[];
     const responseUrl = typeof payload.response_url === 'string' ? payload.response_url : null;
+    const message = payload.message as Record<string, unknown> | undefined;
+    const blocks = Array.isArray(message?.blocks) ? (message!.blocks as Record<string, unknown>[]) : null;
+    // chat.update needs these later, when the undo window closes; unlike a response_url
+    // they do not expire, so the button can be removed however long the agent was down.
+    const channel = String((payload.channel as Record<string, unknown> | undefined)?.id ?? '');
+    const ts = String(message?.ts ?? '');
 
     for (const action of actions) {
-      // Slack threads and Teamwork tasks are dismissed the same way; only the key differs.
-      if (action.action_id !== 'dismiss_thread' && action.action_id !== 'dismiss_task') continue;
-
-      const [recipientId, key, label] = String(action.value ?? '').split('|');
+      const actionId = String(action.action_id ?? '');
+      const value = String(action.value ?? '');
+      const [recipientId, key, label = ''] = value.split('|');
       if (!recipientId || !key) continue;
 
-      addDismissal({ recipientId, key, at: new Date().toISOString(), label: label ?? '' });
-      this.log(`${recipientId} marked ${key} done`);
-      if (!responseUrl) continue;
+      if (DISMISS_ACTIONS.has(actionId)) {
+        await this.dismiss({ recipientId, key, label, value, blocks, responseUrl, channel, ts });
+      } else if (actionId === UNDO_ACTION) {
+        await this.undo({ recipientId, key, label, value, blocks, responseUrl });
+      }
+    }
+  }
 
-      // Rewrite the row in place so the button goes away — clicking Mute twice is
-      // harmless but looks broken.
-      const original = (payload.message as Record<string, unknown> | undefined)?.blocks;
-      const updated = Array.isArray(original)
-        ? muteRow(original as Record<string, unknown>[], String(action.value ?? ''), label ?? '')
-        : null;
+  private async dismiss(a: {
+    recipientId: string; key: string; label: string; value: string;
+    blocks: Record<string, unknown>[] | null; responseUrl: string | null;
+    channel: string; ts: string;
+  }): Promise<void> {
+    const now = new Date();
+    const muted = a.blocks ? muteRow(a.blocks, a.value, a.label) : null;
 
-      const body = updated
-        ? { replace_original: true, text: 'Reminder updated', blocks: updated }
+    // Only offer undo when the row was actually rewritten — otherwise there is no
+    // button to press and nothing to put back.
+    const undo = muted && a.channel && a.ts
+      ? {
+          blocks: muted.removed,
+          message: muted.blocks,
+          channel: a.channel,
+          ts: a.ts,
+          expiresAt: new Date(now.getTime() + getConfig().undoWindowMinutes * 60_000).toISOString(),
+        }
+      : undefined;
+
+    // Refresh first: any undo already open on this message must see the new version,
+    // or removing its button later would revert this dismissal.
+    if (muted && a.channel && a.ts) syncUndoMessage(a.channel, a.ts, muted.blocks);
+    addDismissal({ recipientId: a.recipientId, key: a.key, at: now.toISOString(), label: a.label, undo });
+    this.log(`${a.recipientId} marked ${a.key} done${undo ? ' (undo open)' : ''}`);
+
+    if (!a.responseUrl) return;
+    await this.post(a.responseUrl, muted
+      ? { replace_original: true, text: 'Reminder updated', blocks: muted.blocks }
+      : {
+          response_type: 'ephemeral',
+          replace_original: false,
+          text: `✅ Done — ${a.label || 'that thread'} won't appear in your reminders again.`,
+        });
+  }
+
+  private async undo(a: {
+    recipientId: string; key: string; label: string; value: string;
+    blocks: Record<string, unknown>[] | null; responseUrl: string | null;
+  }): Promise<void> {
+    const held = getDismissals(a.recipientId).find((d) => d.key === a.key);
+    const open = held?.undo && held.undo.expiresAt > new Date().toISOString();
+
+    if (!open) {
+      // The sweeper normally removes the button first; this covers the click that
+      // beats it, and the one on a dismissal already taken back from the dashboard.
+      if (held) clearUndo(a.recipientId, a.key);
+      this.log(`${a.recipientId} pressed undo on ${a.key} after the window closed`);
+      if (!a.responseUrl) return;
+      const stripped = a.blocks ? stripUndoButton(a.blocks, a.value, a.label) : null;
+      await this.post(a.responseUrl, stripped
+        ? { replace_original: true, text: 'Reminder updated', blocks: stripped }
         : {
             response_type: 'ephemeral',
             replace_original: false,
-            text: `✅ Done — ${label || 'that thread'} won't appear in your reminders again.`,
-          };
-
-      await fetch(responseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      }).catch(() => undefined);
+            text: `That undo has expired. You can still bring it back from the dashboard.`,
+          });
+      return;
     }
+
+    const restored = a.blocks ? restoreRow(a.blocks, a.value, held!.undo!.blocks) : null;
+    const { channel, ts } = held!.undo!;
+    removeDismissal(a.recipientId, a.key);
+    if (restored) syncUndoMessage(channel, ts, restored);
+    this.log(`${a.recipientId} undid ${a.key}`);
+
+    if (!a.responseUrl) return;
+    await this.post(a.responseUrl, restored
+      ? { replace_original: true, text: 'Reminder updated', blocks: restored }
+      : {
+          response_type: 'ephemeral',
+          replace_original: false,
+          text: `↩︎ Brought back — ${a.label || 'that thread'} will appear again.`,
+        });
+  }
+
+  private async post(url: string, body: unknown): Promise<void> {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => undefined);
   }
 }

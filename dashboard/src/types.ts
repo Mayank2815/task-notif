@@ -35,6 +35,18 @@ export interface Job {
 
 export type JobKind = 'reminder' | 'digest';
 
+/** One row in the "Marked done" list — enough to show it and to take it back. */
+export interface DismissalRow {
+  recipientId: string;
+  recipientLabel: string;
+  key: string;
+  label: string;
+  at: string;
+  kind: 'task' | 'slack';
+  /** True while Slack still shows an Undo button for it. */
+  undoOpen: boolean;
+}
+
 export interface Config {
   teamworkSiteUrl: string;
   recipients: Recipient[];
@@ -43,6 +55,7 @@ export interface Config {
   sendWhenEmpty: boolean;
   enabled: boolean;
   lookbackDays: number;
+  undoWindowMinutes: number;
   includeDueToday: boolean;
   ignoreCcOnlyMentions: boolean;
   slackMentionsEnabled: boolean;

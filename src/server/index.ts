@@ -7,6 +7,7 @@ import { assertDataDirWritable } from '../config/store.js';
 import { Scheduler } from '../scheduler/index.js';
 import { basicAuth } from './auth.js';
 import { SlackSocket } from '../slack/socket.js';
+import { UndoSweeper } from '../slack/undo-sweeper.js';
 import { buildRouter } from './routes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +41,7 @@ if (dashboardPassword) {
 
 const scheduler = new Scheduler({ teamworkToken, slackToken });
 const socket = slackAppToken ? new SlackSocket(slackAppToken) : null;
+const undoSweeper = slackToken ? new UndoSweeper(slackToken) : null;
 app.use('/api', buildRouter({ teamworkToken, slackToken, scheduler }));
 
 const dashboardDist = resolve(here, '../../dashboard/dist');
@@ -65,6 +67,8 @@ const server = app.listen(port, () => {
   } else {
     console.warn('[server] SLACK_APP_TOKEN not set — Mute buttons will render but do nothing');
   }
+  // Closes any undo window that expired while this process was not running.
+  undoSweeper?.start();
 });
 
 // Without this, a stale process holding the port makes launchd crash-loop in silence.
@@ -84,6 +88,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     scheduler.stop();
     socket?.stop();
+    undoSweeper?.stop();
     process.exit(0);
   });
 }

@@ -113,6 +113,14 @@ export class SlackClient {
     );
     return r.ts;
   }
+
+  /**
+   * Rewrites a message already posted. Every block must be supplied — chat.update
+   * replaces rather than patches — so the caller has to hold the current copy.
+   */
+  async updateMessage(channel: string, ts: string, blocks: unknown[]): Promise<void> {
+    await this.call('chat.update', { channel, ts, text: 'Reminder updated', blocks }, 'json');
+  }
 }
 
 function str(v: unknown): string | undefined {

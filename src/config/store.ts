@@ -75,9 +75,9 @@ export function recordRun(run: RunRecord): void {
 }
 
 /**
- * Threads marked done, permanently. Marking one done is a judgement that it no longer
- * needs this person, and that does not expire — a thread reappearing weeks later would
- * be worse than useless.
+ * Threads marked done. A dismissal does not expire on its own — a thread reappearing
+ * weeks later would be worse than useless. It ends only by being taken back: the Undo
+ * button inside its window, or the dashboard's list at any time.
  */
 export function getDismissals(recipientId?: string): Dismissal[] {
   return load().dismissals.filter((d) => !recipientId || d.recipientId === recipientId);
@@ -89,6 +89,62 @@ export function addDismissal(dismissal: Dismissal): void {
   const next = StoreSchema.parse({ ...data, dismissals: [dismissal, ...others].slice(0, 500) });
   cache = next;
   write(next);
+}
+
+/** Takes a dismissal back. Returns what was removed so the caller can restore the row. */
+export function removeDismissal(recipientId: string, key: string): Dismissal | null {
+  const data = load();
+  const found = data.dismissals.find((d) => d.recipientId === recipientId && d.key === key) ?? null;
+  if (!found) return null;
+  const next = StoreSchema.parse({
+    ...data,
+    dismissals: data.dismissals.filter((d) => !(d.recipientId === recipientId && d.key === key)),
+  });
+  cache = next;
+  write(next);
+  return found;
+}
+
+/**
+ * Closes the undo window without undoing anything: the dismissal stands, but the
+ * stashed blocks go, so the store does not keep message copies indefinitely.
+ */
+export function clearUndo(recipientId: string, key: string): void {
+  const data = load();
+  if (!data.dismissals.some((d) => d.recipientId === recipientId && d.key === key && d.undo)) return;
+  const next = StoreSchema.parse({
+    ...data,
+    dismissals: data.dismissals.map((d) =>
+      d.recipientId === recipientId && d.key === key ? { ...d, undo: undefined } : d,
+    ),
+  });
+  cache = next;
+  write(next);
+}
+
+/**
+ * Keeps every pending undo on one message pointing at the same, current copy of it.
+ * Without this a second Done on the same message would leave the first one holding a
+ * snapshot that no longer matches, and updating from it would undo the second.
+ */
+export function syncUndoMessage(channel: string, ts: string, blocks: Record<string, unknown>[]): void {
+  const data = load();
+  if (!data.dismissals.some((d) => d.undo?.channel === channel && d.undo?.ts === ts)) return;
+  const next = StoreSchema.parse({
+    ...data,
+    dismissals: data.dismissals.map((d) =>
+      d.undo && d.undo.channel === channel && d.undo.ts === ts
+        ? { ...d, undo: { ...d.undo, message: blocks } }
+        : d,
+    ),
+  });
+  cache = next;
+  write(next);
+}
+
+/** Dismissals whose undo window has closed but whose button is still on the message. */
+export function expiredUndos(now: Date = new Date()): Dismissal[] {
+  return load().dismissals.filter((d) => d.undo && d.undo.expiresAt <= now.toISOString());
 }
 
 /**

@@ -19,18 +19,22 @@ const blocks = (): Record<string, unknown>[] => [
   },
 ];
 
-test('marking a task done removes its button', () => {
-  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!;
-  assert.ok(out.every((b) => (b.accessory as { value?: string } | undefined)?.value !== TASK_VALUE));
+test('marking a task done removes its Done button', () => {
+  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!.blocks;
+  const stillDoneable = out.filter(
+    (b) => (b.accessory as { action_id?: string } | undefined)?.action_id === 'dismiss_task'
+      && (b.accessory as { value?: string }).value === TASK_VALUE,
+  );
+  assert.equal(stillDoneable.length, 0);
 });
 
 test('the row is replaced by a note, not deleted without trace', () => {
-  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!;
+  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!.blocks;
   assert.ok(out.some((b) => JSON.stringify(b).includes('Done')));
 });
 
 test('other tasks keep their buttons', () => {
-  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!;
+  const out = muteRow(blocks(), TASK_VALUE, 'Widget')!.blocks;
   const left = out.filter((b) => (b.accessory as { action_id?: string } | undefined)?.action_id === 'dismiss_task');
   assert.equal(left.length, 1);
 });

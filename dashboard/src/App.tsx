@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { Config, Job, JobKind, PersonSuggestion, Preview, Recipient, RuleInfo, Status } from './types.js';
+import type { Config, DismissalRow, Job, JobKind, PersonSuggestion, Preview, Recipient, RuleInfo, Status } from './types.js';
 
 const DAYS = [
   { n: 1, label: 'Mon' }, { n: 2, label: 'Tue' }, { n: 3, label: 'Wed' }, { n: 4, label: 'Thu' },
@@ -22,6 +22,7 @@ export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [rules, setRules] = useState<RuleInfo[]>([]);
+  const [dismissals, setDismissals] = useState<DismissalRow[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [people, setPeople] = useState<PersonSuggestion[]>([]);
@@ -32,14 +33,16 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [c, s, r] = await Promise.all([
+      const [c, s, r, d] = await Promise.all([
         api<{ config: Config }>('/config'),
         api<Status>('/status'),
         api<{ rules: RuleInfo[] }>('/rules'),
+        api<{ dismissals: DismissalRow[] }>('/dismissals'),
       ]);
       setConfig(c.config);
       setStatus(s);
       setRules(r.rules);
+      setDismissals(d.dismissals);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -110,6 +113,27 @@ export default function App() {
     finally { setBusy(null); }
   }
 
+  /**
+   * The way back for a Done pressed longer ago than Slack's undo window allows. The
+   * item returns to the next reminder; if the window happens to still be open, the
+   * Slack message is put back too.
+   */
+  async function undoDismissal(d: DismissalRow) {
+    setBusy(`undo:${d.recipientId}:${d.key}`);
+    setError(null);
+    try {
+      await api('/dismissals/undo', {
+        method: 'POST',
+        body: JSON.stringify({ recipientId: d.recipientId, key: d.key }),
+      });
+      await refresh();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function removeRecipient(r: Recipient) {
     if (!window.confirm(`Remove ${r.label || r.id}? They will stop receiving reminders.`)) return;
     setBusy(`del:${r.id}`); setError(null);
@@ -166,6 +190,10 @@ export default function App() {
           <label className="field">Lookback (days)
             <input type="number" min={1} max={365} value={config.lookbackDays}
               onChange={(e) => patch({ lookbackDays: Number(e.target.value) })} />
+          </label>
+          <label className="field">Undo window (minutes)
+            <input type="number" min={1} max={1440} value={config.undoWindowMinutes}
+              onChange={(e) => patch({ undoWindowMinutes: Number(e.target.value) })} />
           </label>
           <label className="field">Teamwork site
             <input value={config.teamworkSiteUrl} onChange={(e) => patch({ teamworkSiteUrl: e.target.value })} />
@@ -439,6 +467,35 @@ export default function App() {
         </button>
         {saved && <span className="muted">Saved.</span>}
       </div>
+
+      {dismissals.length > 0 && (
+        <section className="card">
+          <h2>Marked done</h2>
+          <p className="muted" style={{ marginTop: -8 }}>
+            Hidden from reminders until someone says something new on them. Bring one back
+            at any time — Slack's own Undo button only lasts {config?.undoWindowMinutes ?? 15} minutes.
+          </p>
+          <div className="runs">
+            {dismissals.map((d) => (
+              <div key={`${d.recipientId}:${d.key}`}>
+                <span className="pill">{d.kind === 'task' ? 'task' : 'slack'}</span>
+                <span>{d.label || d.key}</span>
+                <span className="muted">
+                  {d.recipientLabel} · {new Date(d.at).toLocaleString()}
+                  {d.undoOpen && ' · undo still open in Slack'}
+                </span>
+                <button
+                  className="secondary"
+                  onClick={() => void undoDismissal(d)}
+                  disabled={busy !== null}
+                >
+                  {busy === `undo:${d.recipientId}:${d.key}` ? 'Undoing…' : 'Undo'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {status && status.runs.length > 0 && (
         <section className="card">

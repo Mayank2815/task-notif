@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { ConfigSchema, RecipientSchema } from '../config/schema.js';
-import { getConfig, getRuns, setConfig } from '../config/store.js';
+import { getConfig, getDismissals, getRuns, removeDismissal, setConfig, syncUndoMessage } from '../config/store.js';
 import { discoverHandles, listPeople, slugify } from '../teamwork/discovery.js';
 import { userTokenFor } from '../slack/mentions.js';
 import { runAndDeliver } from '../deliver.js';
@@ -8,6 +8,7 @@ import { makeClient, runScan } from '../pipeline.js';
 import { ALL_RULES } from '../rules/index.js';
 import type { Scheduler } from '../scheduler/index.js';
 import { SlackClient } from '../slack/client.js';
+import { restoreRow } from '../slack/socket.js';
 
 export interface RouterDeps {
   teamworkToken: string;
@@ -143,6 +144,60 @@ export function buildRouter(deps: RouterDeps): Router {
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
+  });
+
+  /**
+   * The Slack Undo button only lives as long as its window. This is the way back for a
+   * Done pressed days ago — no window, because nothing has to be rewritten in place.
+   * The stored message copy is left out; it is large and of no use to the dashboard.
+   */
+  router.get('/dismissals', (_req, res) => {
+    const labelFor = new Map(getConfig().recipients.map((r) => [r.id, r.label]));
+    const now = new Date().toISOString();
+    res.json({
+      dismissals: getDismissals()
+        .slice(0, 100)
+        .map((d) => ({
+          recipientId: d.recipientId,
+          recipientLabel: labelFor.get(d.recipientId) ?? d.recipientId,
+          key: d.key,
+          label: d.label,
+          at: d.at,
+          kind: d.key.startsWith('task:') ? 'task' : 'slack',
+          undoOpen: Boolean(d.undo && d.undo.expiresAt > now),
+        })),
+    });
+  });
+
+  router.post('/dismissals/undo', async (req, res) => {
+    const recipientId = String(req.body?.recipientId ?? '');
+    const key = String(req.body?.key ?? '');
+    const held = getDismissals(recipientId).find((d) => d.key === key);
+    if (!held) {
+      res.status(404).json({ error: 'no such dismissal — it may already have been undone' });
+      return;
+    }
+
+    // Read the undo state before removing it, so the Slack message can be put back too.
+    const undo = held.undo && held.undo.expiresAt > new Date().toISOString() ? held.undo : null;
+    removeDismissal(recipientId, key);
+
+    let restoredInSlack = false;
+    if (undo && deps.slackToken) {
+      const restored = restoreRow(undo.message, `${recipientId}|${key}|${held.label}`, undo.blocks);
+      if (restored) {
+        try {
+          await new SlackClient(deps.slackToken).updateMessage(undo.channel, undo.ts, restored);
+          syncUndoMessage(undo.channel, undo.ts, restored);
+          restoredInSlack = true;
+        } catch {
+          // The reminder itself is what matters; a message that cannot be rewritten
+          // is cosmetic, and the item returns tomorrow either way.
+        }
+      }
+    }
+
+    res.json({ ok: true, restoredInSlack });
   });
 
   router.post('/test-send', async (req, res) => {
