@@ -107,7 +107,9 @@ export async function runAndDeliver(
         const digest = await buildDigest(
           client, { ...ws, activity }, config, r, DateTime.now(), mentions, 1, slackActivity, meetings, span.days,
         );
-        summary = await writeStandupSummary(digest, config, (m) => log(`${r.label}: ${m}`));
+        summary = await writeStandupSummary(
+          digest, config, (m) => log(`${r.label}: ${m}`), slackConnectedFor(config, r.id),
+        );
         log(`${r.label}: ${span.label} — ${digest.updates.length} worked on, ${digest.completed.length} closed, ${slackActivity.length} conversations, ${meetings.length} calls`);
       }
 
@@ -133,7 +135,9 @@ export async function runAndDeliver(
       const digest = await buildDigest(
         client, { ...ws, activity }, config, recipient, DateTime.now(), mentions, 0, slackActivity, meetings,
       );
-      digest.summary = await writeStandupSummary(digest, config, (m) => log(`${recipient.label}: ${m}`));
+      digest.summary = await writeStandupSummary(
+        digest, config, (m) => log(`${recipient.label}: ${m}`), slackConnectedFor(config, recipient.id),
+      );
       log(
         `${recipient.label}: ${digest.updates.length} updates, ${digest.mentionsOpen.length} open, ` +
         `${digest.mentionsAnswered.length} answered, slack ${digest.slackReplied.length} replied / ${digest.slackAwaiting.length} awaiting`,
@@ -234,7 +238,6 @@ async function slackMentionsFor(
   }
 }
 
-/** Where this person spoke, and what calls happened, on the day being reported. */
 /**
  * Slack only answers per-day, so a multi-day window costs one pair of calls per
  * day. Channels seen on more than one day are folded together rather than listed
@@ -259,6 +262,17 @@ export function mergeChannelActivity(days: ChannelActivity[][]): ChannelActivity
   return [...byChannel.values()];
 }
 
+/**
+ * Whether this person's Slack can be seen at all. Without a user token the Slack half of
+ * every summary is empty, which must not be read as "nothing happened there".
+ */
+export function slackConnectedFor(config: Config, recipientId: string): boolean {
+  if (!config.slackMentionsEnabled) return false;
+  const recipient = config.recipients.find((r) => r.id === recipientId);
+  return userTokenFor(recipientId, recipient?.slackUserToken ?? '') !== null;
+}
+
+/** Where this person spoke, and what calls happened, on the day being reported. */
 async function slackDayFor(
   config: Config,
   recipientId: string,

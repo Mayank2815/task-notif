@@ -13,6 +13,15 @@ const MAX_TIMEOUT_MS = 2_147_483_647; // setTimeout overflows past ~24.8 days an
 const RETRY_DELAYS_MS = [60_000, 180_000, 600_000, 1_800_000];
 /** A whole run should take minutes; past this something is wedged and retrying is better. */
 const RUN_TIMEOUT_MS = 12 * 60_000;
+/**
+ * How often to re-check whether a slot is still owed. The retry ladder above covers
+ * about the first three quarters of an hour and then gives up, but the catch-up grace
+ * window stays open for hours — so a network outage that outlasted the ladder used to
+ * lose the day even though the machine was up and the window was open. Fifteen minutes
+ * is frequent enough that nobody waits long, and cheap because a slot that is already
+ * satisfied costs one comparison.
+ */
+export const CATCHUP_POLL_MS = 15 * 60_000;
 
 export const JOB_KINDS: JobKind[] = ['reminder', 'digest'];
 
@@ -62,6 +71,7 @@ export function shouldCatchUp(config: Config, job: Job, now: DateTime, lastSucce
 export class Scheduler {
   private readonly timers = new Map<JobKind, NodeJS.Timeout>();
   private readonly retryTimers = new Map<JobKind, NodeJS.Timeout>();
+  private catchUpTimer: NodeJS.Timeout | null = null;
   private readonly running = new Set<JobKind>();
   private readonly log: (m: string) => void;
 
@@ -70,29 +80,44 @@ export class Scheduler {
   }
 
   start(): void {
+    this.catchUp();
+    // The window stays open for hours after the slot, so keep checking it, not just once
+    // at startup — otherwise recovery depends on somebody restarting the process.
+    this.catchUpTimer = setInterval(() => this.catchUp(), CATCHUP_POLL_MS);
+    this.catchUpTimer.unref?.();
+    this.scheduleAll();
+  }
+
+  /** Fires any slot that is still owed and still inside its grace window. */
+  private catchUp(): void {
     const config = getConfig();
     for (const kind of JOB_KINDS) {
-      // Any SUCCESSFUL send satisfies the slot, however it was triggered. Sending the
-      // missed reminder by hand and then restarting must not deliver it a second time.
-      // Failures are excluded: that slot is still owed.
-      const last = getRuns().find((r) => r.job === kind && r.ok)?.at ?? null;
       // A restart during a slot must not silently skip it.
       if (process.env.SUPPRESS_CATCHUP === '1') {
         this.log(`${kind}: catch-up suppressed by SUPPRESS_CATCHUP`);
         continue;
       }
+      // A run in flight, or a retry already booked, will settle this slot on its own.
+      // Starting another here would deliver the same message twice.
+      if (this.running.has(kind) || this.retryTimers.has(kind)) continue;
+
+      // Any SUCCESSFUL send satisfies the slot, however it was triggered. Sending the
+      // missed reminder by hand and then restarting must not deliver it a second time.
+      // Failures are excluded: that slot is still owed.
+      const last = getRuns().find((r) => r.job === kind && r.ok)?.at ?? null;
       if (shouldCatchUp(config, config.jobs[kind], DateTime.now(), last)) {
         const slot = config.jobs[kind].time;
-        this.log(`missed today's ${kind} slot (${slot}) while the machine was off — sending it now`);
-        void this.fire(kind, `⏰ Late — your machine was off at ${slot}`);
+        this.log(`${kind}: ${slot} slot still owed — sending it now`);
+        void this.fire(kind, `⏰ Late — this did not get through at ${slot}`);
       }
     }
-    this.scheduleAll();
   }
 
   stop(): void {
     for (const timer of this.timers.values()) clearTimeout(timer);
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    if (this.catchUpTimer) clearInterval(this.catchUpTimer);
+    this.catchUpTimer = null;
     this.timers.clear();
     this.retryTimers.clear();
   }
@@ -154,6 +179,7 @@ export class Scheduler {
       this.log(`${kind}: previous run still in flight — skipping this tick`);
       return;
     }
+    this.retryTimers.delete(kind);
     this.running.add(kind);
     try {
       const started = Date.now();

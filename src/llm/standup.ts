@@ -7,7 +7,7 @@ import { generate } from './gemini.js';
  * Facts sent to Gemini. DM text is withheld by default — a DM is the most private
  * thing this tool touches, and the summary rarely needs its contents.
  */
-export function buildPrompt(digest: Digest, includeDmText: boolean): string {
+export function buildPrompt(digest: Digest, includeDmText: boolean, slackConnected = true): string {
   const lines: string[] = [];
 
   const add = (heading: string, entries: string[]) => {
@@ -49,6 +49,12 @@ export function buildPrompt(digest: Digest, includeDmText: boolean): string {
     '- Write plainly, first person, past tense. No preamble, no heading, no sign-off.',
     '- Keep each bullet to one line. Prefer concrete task names over vague phrasing.',
     '- If the facts are thin, say so briefly rather than padding.',
+    ...(slackConnected
+      ? []
+      : [
+          '- Slack was NOT searched for this person. Say nothing about Slack, and do not claim',
+          '  that nothing is outstanding — you have only seen their Teamwork activity.',
+        ]),
     '',
     '--- FACTS ---',
     lines.join('\n').trim() || '(no recorded activity today)',
@@ -64,16 +70,17 @@ export async function writeStandupSummary(
   digest: Digest,
   config: Config,
   log: (m: string) => void = () => {},
+  slackConnected = true,
 ): Promise<string | null> {
   if (digest.total === 0) return null;
 
-  const fallback = buildFactualSummary(digest);
+  const fallback = buildFactualSummary(digest, slackConnected);
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!config.standupSummaryEnabled || !apiKey) return fallback;
 
   try {
-    const summary = await generate(apiKey, buildPrompt(digest, config.standupSummaryIncludeDmText));
+    const summary = await generate(apiKey, buildPrompt(digest, config.standupSummaryIncludeDmText, slackConnected));
     if (summary) {
       log('standup summary written by Gemini');
       return summary.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

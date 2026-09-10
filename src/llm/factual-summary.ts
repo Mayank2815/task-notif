@@ -12,7 +12,7 @@ const NAME_MAX = 58; // long enough to recognise a ticket, short enough to keep 
  * at the ticket while it is read out. Interpolated text is escaped here, so callers must
  * NOT escape the result again.
  */
-export function buildFactualSummary(digest: Digest): string | null {
+export function buildFactualSummary(digest: Digest, slackConnected = true): string | null {
   const lines: string[] = [];
 
   // Several comments on one task is still one task; the summary counts work, not chatter.
@@ -80,11 +80,20 @@ export function buildFactualSummary(digest: Digest): string | null {
 
   if (lines.length === 0 && open.length === 0) return null;
 
+  // Without a Slack user token the Slack half is invisible, so "nothing waiting" would
+  // be an absolute claim made from half the evidence — read out at stand-up, in front of
+  // a lead. Say what was actually looked at instead.
   lines.push(
     open.length > 0
       ? `*Still open* — ${open.slice(0, 5).join('; ')}${more(open.length, 5)}`
-      : '*Still open* — nothing waiting on a reply.',
+      : slackConnected
+        ? '*Still open* — nothing waiting on a reply.'
+        : '*Still open* — nothing waiting in Teamwork.',
   );
+
+  if (!slackConnected) {
+    lines.push('_Slack is not connected for this account, so nothing above covers Slack._');
+  }
 
   return lines.map((l) => `• ${l}`).join('\n');
 }
