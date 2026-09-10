@@ -95,8 +95,15 @@ export function digestWindow(
   spanDays = 1,
 ): { start: DateTime; end: DateTime; label: string } {
   const local = now.setZone(config.timezone);
-  if (dayOffset === 0) {
+  // Today so far, which is what the evening digest reports.
+  if (dayOffset === 0 && Math.max(1, spanDays) === 1) {
     return { start: local.startOf('day'), end: local, label: dayLabel(local) };
+  }
+  // A range that runs up to now: the same open end, but starting further back. Only a
+  // report asks for this; every scheduled job passes a span of one.
+  if (dayOffset === 0) {
+    const start = local.startOf('day').minus({ days: spanDays - 1 });
+    return { start, end: local, label: `${dayLabel(start)} – ${dayLabel(local)}` };
   }
   const end = local.minus({ days: dayOffset }).startOf('day');
   const start = end.minus({ days: Math.max(1, spanDays) - 1 });

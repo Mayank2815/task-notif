@@ -15,6 +15,14 @@ export const RecipientSchema = z.object({
    * so an operator can keep secrets out of the store file if they prefer.
    */
   slackUserToken: z.string().default(''),
+  /**
+   * This person's own Teamwork API token, so a reply they send from Slack is posted by
+   * them. The shared token authenticates as one person and Teamwork has no way to post
+   * on someone else's behalf, so without this a reply would be filed under the wrong
+   * name in the system of record. Optional: no token simply means no reply button.
+   * TEAMWORK_USER_TOKEN_<ID> in the environment takes precedence.
+   */
+  teamworkUserToken: z.string().default(''),
   enabled: z.boolean().default(true),
   /** Send this person a copy of another recipient's list instead of their own. */
   mirrorOf: z.string().nullable().default(null),
@@ -31,7 +39,7 @@ export const JobSchema = z.object({
 });
 
 export type Job = z.infer<typeof JobSchema>;
-export type JobKind = 'reminder' | 'digest';
+export type JobKind = 'reminder' | 'digest' | 'weekly';
 
 export const ConfigSchema = z.object({
   teamworkSiteUrl: z.string().url().default('https://projects.example.com'),
@@ -42,6 +50,13 @@ export const ConfigSchema = z.object({
     reminder: JobSchema.default({ time: '09:00' }),
     /** Evening: what you did today, while it is fresh. */
     digest: JobSchema.default({ time: '21:00' }),
+    /**
+     * Friday evening: the week in review. Friday rather than Monday morning, because the
+     * week closes on a Friday and Monday's message is already carrying the weekend's
+     * stand-up. Each person gets their own — three of the five sit on another team, so a
+     * single roll-up to one lead would be noise to most of them.
+     */
+    weekly: JobSchema.default({ time: '19:00', daysOfWeek: [5] }),
   }).default({}),
 
   /**
@@ -122,7 +137,7 @@ export type Config = z.infer<typeof ConfigSchema>;
 
 export const RunRecordSchema = z.object({
   at: z.string(),
-  job: z.enum(['reminder', 'digest']).default('reminder'),
+  job: z.enum(['reminder', 'digest', 'weekly']).default('reminder'),
   trigger: z.enum(['scheduled', 'manual']),
   ok: z.boolean(),
   detail: z.string(),

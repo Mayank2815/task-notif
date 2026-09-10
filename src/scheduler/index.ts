@@ -23,7 +23,7 @@ const RUN_TIMEOUT_MS = 12 * 60_000;
  */
 export const CATCHUP_POLL_MS = 15 * 60_000;
 
-export const JOB_KINDS: JobKind[] = ['reminder', 'digest'];
+export const JOB_KINDS: JobKind[] = ['reminder', 'digest', 'weekly'];
 
 export interface SchedulerDeps {
   teamworkToken: string;
@@ -133,6 +133,7 @@ export class Scheduler {
     return {
       reminder: nextFireTime(config, config.jobs.reminder)?.toISO() ?? null,
       digest: nextFireTime(config, config.jobs.digest)?.toISO() ?? null,
+      weekly: nextFireTime(config, config.jobs.weekly)?.toISO() ?? null,
     };
   }
 

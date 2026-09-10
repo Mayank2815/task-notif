@@ -8,7 +8,7 @@ import { SlackClient } from './slack/client.js';
 import { renderDigest } from './slack/digest-message.js';
 import { renderReminder } from './slack/message.js';
 import {
-  SlackMentionSearch, userTokenFor,
+  SlackMentionSearch, envKeyFor, userTokenFor,
   type ChannelActivity, type MeetingMention, type SlackMention,
 } from './slack/mentions.js';
 
@@ -116,7 +116,37 @@ export async function runAndDeliver(
       messages.push({
         recipient: r,
         total: result.total + awaiting.length,
-        rendered: renderReminder(result, config.timezone, awaiting, note, summary, span.label, span.days),
+        rendered: renderReminder(
+          result, config.timezone, awaiting, note, summary, span.label, span.days, canReplyAs(config, r.id),
+        ),
+      });
+    }
+  } else if (job === 'weekly') {
+    // The week just worked, Monday through now. Derived from the weekday rather than
+    // fixed at five days, so moving the job to Thursday reports Monday to Thursday
+    // instead of silently reaching back into the previous week.
+    const local = DateTime.now().setZone(config.timezone);
+    const spanDays = local.weekday;
+    const client = makeClient(config, teamworkToken);
+    const ws = await collectWorkspace(client, log, config).catch(recordFailure);
+    const weekStart = local.startOf('day').minus({ days: spanDays - 1 });
+    const activity = await client.activitySince(weekStart.toUTC().toISO() ?? '').catch(recordFailure);
+    log(`week in review: ${spanDays} day(s) from ${weekStart.toFormat('cccc, d LLLL')}`);
+
+    for (const recipient of config.recipients.filter((r) => r.enabled)) {
+      // Slack is left out: its search answers a day at a time, so a whole week would
+      // cost five more round trips per person for a line nobody reads on a Friday.
+      const digest = await buildDigest(
+        client, { ...ws, activity }, config, recipient, DateTime.now(), [], 0, [], [], spanDays,
+      );
+      digest.summary = await writeStandupSummary(
+        digest, config, (m) => log(`${recipient.label}: ${m}`), false,
+      );
+      log(`${recipient.label}: week — ${digest.updates.length} updates, ${digest.completed.length} closed`);
+      messages.push({
+        recipient,
+        total: digest.total,
+        rendered: renderDigest(digest, config.timezone, note, 'week'),
       });
     }
   } else {
@@ -260,6 +290,17 @@ export function mergeChannelActivity(days: ChannelActivity[][]): ChannelActivity
     }
   }
   return [...byChannel.values()];
+}
+
+/**
+ * Whether this person can post a reply as themselves. Without their own Teamwork token a
+ * comment would be filed under whoever owns the shared one, so the button is not offered.
+ */
+export function canReplyAs(config: Config, recipientId: string): boolean {
+  const fromEnv = process.env[envKeyFor('TEAMWORK_USER_TOKEN', recipientId)];
+  if (fromEnv && fromEnv.trim().length > 0) return true;
+  const stored = config.recipients.find((r) => r.id === recipientId)?.teamworkUserToken ?? '';
+  return stored.trim().length > 0;
 }
 
 /**

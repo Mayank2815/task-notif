@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon';
 import type { RecipientResult } from '../pipeline.js';
 import { cleanTaskName } from '../teamwork/identity.js';
+import { replyButtonBlock } from './reply.js';
 import type { SlackMention } from './mentions.js';
 
 const MAX_ITEMS_PER_GROUP = 12;
@@ -98,6 +99,8 @@ export function renderReminder(
   /** The period the stand-up covers. On a Monday it spans the whole weekend. */
   standupLabel: string | null = null,
   standupDays = 1,
+  /** Adds the read-in-full / reply button. One block for the whole message, not per row. */
+  canReply = false,
 ): RenderedMessage {
   const name = result.recipient.label || result.identity.displayName;
   const now = DateTime.now().setZone(timezone);
@@ -165,7 +168,12 @@ export function renderReminder(
     });
   }
 
-  return { text: `${totalItems} items need your attention — ${today}`, blocks: assembleWithBudget(intro, sections) };
+  const blocks = assembleWithBudget(intro, sections);
+  // Added after the budget is settled: a single block, and losing a task row to make
+  // room for it would be the wrong trade.
+  if (canReply && blocks.length < MAX_BLOCKS) blocks.push(replyButtonBlock(result.recipient.id));
+
+  return { text: `${totalItems} items need your attention — ${today}`, blocks };
 }
 
 /** One task, numbered so it can be referred to out loud in stand-up. */

@@ -73,6 +73,36 @@ export class TeamworkClient {
     throw new TeamworkError('unreachable');
   }
 
+  /**
+   * Posts a comment on a task, as whoever owns the token this client was built with.
+   * Teamwork has no way to post on another person's behalf, so the token IS the author —
+   * which is why a reply sent from Slack has to use that person's own token.
+   *
+   * Creating a comment is a v1 endpoint; v3 only reads them. Deliberately not retried:
+   * every other call here is a read and safe to repeat, but a comment that may already
+   * have landed must not be posted twice.
+   */
+  async postComment(taskId: number, body: string): Promise<number> {
+    await this.throttle();
+    const res = await fetch(`${this.base}/tasks/${taskId}/comments.json`, {
+      method: 'POST',
+      headers: {
+        Authorization: this.auth,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      // Plain text: the reply box is a Slack input, so anything else would be a lie
+      // about what the person typed.
+      body: JSON.stringify({ comment: { body, 'content-type': 'text', notify: '' } }),
+    });
+
+    if (!res.ok) {
+      throw new TeamworkError(`Teamwork ${res.status} posting a comment on task ${taskId}`, res.status, await safeText(res));
+    }
+    const data = (await res.json()) as { commentId?: number | string; comment?: { id?: number | string } };
+    return Number(data.commentId ?? data.comment?.id ?? 0);
+  }
+
   /** Walks every page of a v3 collection and returns the flattened rows plus merged sideloads. */
   async paginate<T = Record<string, unknown>>(
     path: string,

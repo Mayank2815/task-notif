@@ -1,14 +1,15 @@
 import { Router } from 'express';
-import { ConfigSchema, RecipientSchema } from '../config/schema.js';
+import { ConfigSchema, RecipientSchema, type JobKind } from '../config/schema.js';
 import { getConfig, getDismissals, getRuns, removeDismissal, setConfig, syncUndoMessage } from '../config/store.js';
 import { discoverHandles, listPeople, slugify } from '../teamwork/discovery.js';
-import { userTokenFor } from '../slack/mentions.js';
+import { envKeyFor, userTokenFor } from '../slack/mentions.js';
 import { runAndDeliver } from '../deliver.js';
 import { makeClient, runScan } from '../pipeline.js';
 import { ALL_RULES } from '../rules/index.js';
 import type { Scheduler } from '../scheduler/index.js';
 import { SlackClient } from '../slack/client.js';
 import { restoreRow } from '../slack/socket.js';
+import { buildRangeReport, windowFor, type RangeReport } from '../report.js';
 
 export interface RouterDeps {
   teamworkToken: string;
@@ -16,8 +17,28 @@ export interface RouterDeps {
   scheduler: Scheduler;
 }
 
+/**
+ * A range report sweeps months of Teamwork and can run for minutes, which is far too
+ * long to hold an HTTP request open. Jobs are kept in memory only: losing them on a
+ * restart costs nothing, because the report is rebuilt from Teamwork every time.
+ */
+interface ReportJob {
+  id: string;
+  from: string;
+  to: string;
+  startedAt: string;
+  status: 'running' | 'done' | 'failed';
+  progress: string[];
+  result: RangeReport | null;
+  error: string | null;
+}
+
+/** Enough to keep the last couple of attempts around without growing forever. */
+const MAX_REPORT_JOBS = 5;
+
 export function buildRouter(deps: RouterDeps): Router {
   const router = Router();
+  const reportJobs: ReportJob[] = [];
 
   /**
    * Tokens are write-only: the UI shows whether one is in effect, never its value.
@@ -27,12 +48,19 @@ export function buildRouter(deps: RouterDeps): Router {
   function redact(config: ReturnType<typeof getConfig>) {
     return {
       ...config,
-      recipients: config.recipients.map(({ slackUserToken, ...rest }) => ({
+      recipients: config.recipients.map(({ slackUserToken, teamworkUserToken, ...rest }) => ({
         ...rest,
         hasSlackUserToken: Boolean(userTokenFor(rest.id, slackUserToken)),
-        slackUserTokenSource: process.env[`SLACK_USER_TOKEN_${rest.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`]
+        slackUserTokenSource: process.env[envKeyFor('SLACK_USER_TOKEN', rest.id)]
           ? 'environment'
           : slackUserToken.trim().length > 0 ? 'dashboard' : null,
+        // Same shape for the Teamwork token: whether one is in effect, never its value.
+        hasTeamworkUserToken: Boolean(
+          process.env[envKeyFor('TEAMWORK_USER_TOKEN', rest.id)]?.trim() || teamworkUserToken.trim(),
+        ),
+        teamworkUserTokenSource: process.env[envKeyFor('TEAMWORK_USER_TOKEN', rest.id)]
+          ? 'environment'
+          : teamworkUserToken.trim().length > 0 ? 'dashboard' : null,
       })),
     };
   }
@@ -52,9 +80,12 @@ export function buildRouter(deps: RouterDeps): Router {
     const patch = { ...parsed.data };
     if (patch.recipients) {
       patch.recipients = patch.recipients.map((r) => {
-        if (r.slackUserToken?.trim()) return r;
         const existing = current.recipients.find((c) => c.id === r.id);
-        return { ...r, slackUserToken: existing?.slackUserToken ?? '' };
+        return {
+          ...r,
+          slackUserToken: r.slackUserToken?.trim() ? r.slackUserToken : existing?.slackUserToken ?? '',
+          teamworkUserToken: r.teamworkUserToken?.trim() ? r.teamworkUserToken : existing?.teamworkUserToken ?? '',
+        };
       });
     }
 
@@ -200,11 +231,61 @@ export function buildRouter(deps: RouterDeps): Router {
     res.json({ ok: true, restoredInSlack });
   });
 
+  /**
+   * Appraisal-time question: what did each person actually do between two dates?
+   * Answered from Teamwork rather than from stored history, because none is kept —
+   * which is why it works for months that have already gone by.
+   */
+  router.post('/report', (req, res) => {
+    const from = String(req.body?.from ?? '');
+    const to = String(req.body?.to ?? '');
+    const config = getConfig();
+
+    try {
+      if (!deps.teamworkToken) throw new Error('TEAMWORK_API_TOKEN is not set');
+      // Fail on a bad range now, while someone is looking at the screen.
+      windowFor(from, to, config.timezone);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+      return;
+    }
+
+    const job: ReportJob = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      from, to, startedAt: new Date().toISOString(),
+      status: 'running', progress: [], result: null, error: null,
+    };
+    reportJobs.unshift(job);
+    reportJobs.length = Math.min(reportJobs.length, MAX_REPORT_JOBS);
+
+    void buildRangeReport(config, deps.teamworkToken, from, to, (m) => {
+      job.progress.push(m);
+      console.log(`[report ${job.id}] ${m}`);
+    })
+      .then((result) => { job.result = result; job.status = 'done'; })
+      .catch((err: Error) => { job.error = err.message; job.status = 'failed'; });
+
+    res.status(202).json({ id: job.id });
+  });
+
+  router.get('/report/:id', (req, res) => {
+    const job = reportJobs.find((j) => j.id === req.params.id);
+    if (!job) {
+      res.status(404).json({ error: 'no such report — it may have been dropped on a restart' });
+      return;
+    }
+    res.json({
+      id: job.id, from: job.from, to: job.to, status: job.status,
+      progress: job.progress.slice(-8), result: job.result, error: job.error,
+    });
+  });
+
   router.post('/test-send', async (req, res) => {
     try {
       if (!deps.teamworkToken) throw new Error('TEAMWORK_API_TOKEN is not set');
       if (!deps.slackToken) throw new Error('SLACK_BOT_TOKEN is not set');
-      const job = req.body?.job === 'digest' ? 'digest' : 'reminder';
+      const asked = String(req.body?.job ?? '');
+      const job: JobKind = asked === 'digest' || asked === 'weekly' ? asked : 'reminder';
       const only = typeof req.body?.recipientId === 'string' ? req.body.recipientId : null;
       // Sending to one person lets you test without DMing everyone.
       const base = getConfig();

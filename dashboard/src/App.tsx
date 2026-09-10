@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { Config, DismissalRow, Job, JobKind, PersonSuggestion, Preview, Recipient, RuleInfo, Status } from './types.js';
+import type { Config, DismissalRow, Job, JobKind, PersonSuggestion, Preview, Recipient, ReportJob, RuleInfo, Status } from './types.js';
 
 const DAYS = [
   { n: 1, label: 'Mon' }, { n: 2, label: 'Tue' }, { n: 3, label: 'Wed' }, { n: 4, label: 'Thu' },
@@ -23,6 +23,15 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [dismissals, setDismissals] = useState<DismissalRow[]>([]);
+  const [report, setReport] = useState<ReportJob | null>(null);
+  const [range, setRange] = useState(() => {
+    // Last full month, because that is what an appraisal conversation asks about.
+    const now = new Date();
+    const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const last = new Date(now.getFullYear(), now.getMonth(), 0);
+    const iso = (d: Date) => d.toISOString().slice(0, 10);
+    return { from: iso(first), to: iso(last) };
+  });
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [people, setPeople] = useState<PersonSuggestion[]>([]);
@@ -134,6 +143,29 @@ export default function App() {
     }
   }
 
+  /**
+   * Reports take minutes on a long range, so the server hands back a job and this
+   * follows it. Nothing is stored — it is rebuilt from Teamwork each time.
+   */
+  async function runReport() {
+    setError(null);
+    setReport(null);
+    try {
+      const { id } = await api<{ id: string }>('/report', {
+        method: 'POST',
+        body: JSON.stringify(range),
+      });
+      const poll = async () => {
+        const job = await api<ReportJob>(`/report/${id}`);
+        setReport(job);
+        if (job.status === 'running') setTimeout(() => void poll(), 2000);
+      };
+      await poll();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
   async function removeRecipient(r: Recipient) {
     if (!window.confirm(`Remove ${r.label || r.id}? They will stop receiving reminders.`)) return;
     setBusy(`del:${r.id}`); setError(null);
@@ -200,7 +232,7 @@ export default function App() {
           </label>
         </div>
 
-        {(['reminder', 'digest'] as JobKind[]).map((kind) => {
+        {(['reminder', 'digest', 'weekly'] as JobKind[]).map((kind) => {
           const job = config.jobs[kind];
           const setJob = (p: Partial<Job>) => patch({ jobs: { ...config.jobs, [kind]: { ...job, ...p } } });
           return (
@@ -372,6 +404,15 @@ export default function App() {
                     placeholder={r.slackUserTokenSource === 'environment' ? 'set in .env — edit there' : r.hasSlackUserToken ? 'leave blank to keep' : 'xoxp-… (optional)'}
                     onChange={(e) => setR({ slackUserToken: e.target.value })} />
                 </label>
+                <label className="field">
+                  Teamwork token {r.hasTeamworkUserToken
+                    ? <span className="pill">set via {r.teamworkUserTokenSource}</span>
+                    : <span className="muted">not set — no reply button</span>}
+                  <input type="password" value={r.teamworkUserToken ?? ''}
+                    disabled={r.teamworkUserTokenSource === 'environment'}
+                    placeholder={r.teamworkUserTokenSource === 'environment' ? 'set in .env — edit there' : r.hasTeamworkUserToken ? 'leave blank to keep' : 'their own token, so replies are filed as them'}
+                    onChange={(e) => setR({ teamworkUserToken: e.target.value })} />
+                </label>
                 <label className="field">Send a copy of (instead of their own list)
                   <select value={r.mirrorOf ?? ''} onChange={(e) => setR({ mirrorOf: e.target.value || null })}>
                     <option value="">— their own list —</option>
@@ -467,6 +508,75 @@ export default function App() {
         </button>
         {saved && <span className="muted">Saved.</span>}
       </div>
+
+      <section className="card">
+        <h2>Report a date range</h2>
+        <p className="muted" style={{ marginTop: -8 }}>
+          What each person closed and worked on between two dates — for appraisals and reviews.
+          Read from Teamwork each time, so it works for months that have already passed. Slack is
+          not included: its history is per-person and depends on the workspace's retention.
+        </p>
+        <div className="grid">
+          <label className="field">From
+            <input type="date" value={range.from} onChange={(e) => setRange((r) => ({ ...r, from: e.target.value }))} />
+          </label>
+          <label className="field">To
+            <input type="date" value={range.to} onChange={(e) => setRange((r) => ({ ...r, to: e.target.value }))} />
+          </label>
+        </div>
+        <div className="actions" style={{ marginTop: 12 }}>
+          <button onClick={() => void runReport()} disabled={report?.status === 'running'}>
+            {report?.status === 'running' ? 'Building…' : 'Build report'}
+          </button>
+          {report?.status === 'running' && (
+            <span className="muted">{report.progress[report.progress.length - 1] ?? 'starting…'}</span>
+          )}
+          {report?.status === 'failed' && <span className="muted">Failed: {report.error}</span>}
+        </div>
+
+        {report?.result && (
+          <div style={{ marginTop: 16 }}>
+            <p className="muted">
+              {report.result.from} to {report.result.to} · {report.result.days} days ·
+              {' '}{report.result.stats.commentsSwept} comments read ·
+              {' '}{(report.result.stats.durationMs / 1000).toFixed(0)}s
+            </p>
+            {report.result.people.map((p) => (
+              <div key={p.recipientId} style={{ marginTop: 20 }}>
+                <strong>{p.label}</strong>{' '}
+                <span className="pill">{p.completed.length} closed</span>{' '}
+                <span className="pill">{p.workedOn.length} tasks touched</span>{' '}
+                <span className="pill">{p.comments} comments</span>
+                {p.completed.length === 0 && p.workedOn.length === 0 && (
+                  <p className="muted">Nothing recorded in this range.</p>
+                )}
+                {p.completed.length > 0 && (
+                  <div>
+                    <div className="group-head">Closed ({p.completed.length})</div>
+                    {p.completed.map((t) => (
+                      <div className="item" key={`c${t.taskId}`}>
+                        <a href={t.link} target="_blank" rel="noreferrer">{t.taskName}</a>
+                        <div className="meta">{t.project ?? '—'} · {t.at.slice(0, 10)}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {p.workedOn.length > 0 && (
+                  <div>
+                    <div className="group-head">Worked on ({p.workedOn.length})</div>
+                    {p.workedOn.map((t) => (
+                      <div className="item" key={`w${t.taskId}`}>
+                        <a href={t.link} target="_blank" rel="noreferrer">{t.taskName}</a>
+                        <div className="meta">{t.project ?? '—'}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {dismissals.length > 0 && (
         <section className="card">

@@ -1,6 +1,12 @@
 import {
   addDismissal, clearUndo, getConfig, getDismissals, removeDismissal, syncUndoMessage,
 } from '../config/store.js';
+import { TeamworkClient } from '../teamwork/client.js';
+import { envKeyFor } from './mentions.js';
+import {
+  pickerView, readSubmission, replyView, tasksInMessage,
+  REPLY_CALLBACK, REPLY_OPEN_ACTION, REPLY_PICK_ACTION, type ReplyTask,
+} from './reply.js';
 
 /** The action ids that mark something done; both are undone the same way. */
 const DISMISS_ACTIONS = new Set(['dismiss_thread', 'dismiss_task']);
@@ -141,6 +147,10 @@ export class SlackSocket {
 
   constructor(
     private readonly appToken: string,
+    /** Opens and updates modals. Without it the buttons still record, but no view appears. */
+    private readonly botToken = '',
+    /** Reads a comment in full when a modal asks for it; replies use the person's own. */
+    private readonly teamworkToken = '',
     private readonly log: (m: string) => void = (m) => console.log(`[slack-socket] ${m}`),
   ) {}
 
@@ -240,6 +250,10 @@ export class SlackSocket {
     if (envelope.envelope_id) ws.send(JSON.stringify({ envelope_id: envelope.envelope_id }));
 
     if (envelope.type !== 'interactive' || !envelope.payload) return;
+    if (envelope.payload.type === 'view_submission') {
+      await this.submitReply(envelope.payload);
+      return;
+    }
     await this.handleAction(envelope.payload);
   }
 
@@ -261,6 +275,10 @@ export class SlackSocket {
       const [recipientId, key, label = ''] = value.split('|');
       if (!recipientId || !key) continue;
 
+      if (actionId === REPLY_OPEN_ACTION || actionId === REPLY_PICK_ACTION) {
+        await this.reply(actionId, action, payload);
+        continue;
+      }
       if (DISMISS_ACTIONS.has(actionId)) {
         await this.dismiss({ recipientId, key, label, value, blocks, responseUrl, channel, ts });
       } else if (actionId === UNDO_ACTION) {
@@ -343,6 +361,116 @@ export class SlackSocket {
           replace_original: false,
           text: `↩︎ Brought back — ${a.label || 'that thread'} will appear again.`,
         });
+  }
+
+  /** Opens the reply modal, and fills it in once a task is chosen. */
+  private async reply(
+    actionId: string, action: Record<string, unknown>, payload: Record<string, unknown>,
+  ): Promise<void> {
+    const triggerId = String(payload.trigger_id ?? '');
+    if (!triggerId || !this.botToken) return;
+
+    if (actionId === REPLY_OPEN_ACTION) {
+      const recipientId = String(action.value ?? '');
+      const message = payload.message as Record<string, unknown> | undefined;
+      const blocks = Array.isArray(message?.blocks) ? (message!.blocks as Record<string, unknown>[]) : [];
+      const tasks = tasksInMessage(blocks);
+      this.log(`${recipientId} opened reply (${tasks.length} task(s) offered)`);
+      await this.slack('views.open', { trigger_id: triggerId, view: pickerView(recipientId, tasks) });
+      return;
+    }
+
+    // A task was chosen: fetch the comment itself, then swap the view for the full text.
+    const view = payload.view as Record<string, unknown> | undefined;
+    const viewId = String(view?.id ?? '');
+    const selected = (action.selected_option as Record<string, unknown> | undefined)?.value;
+    const taskId = Number(selected ?? 0);
+    if (!viewId || !taskId) return;
+
+    let meta: { recipientId?: string } = {};
+    try { meta = JSON.parse(String(view?.private_metadata ?? '{}')); } catch { /* keep empty */ }
+    const recipientId = meta.recipientId ?? '';
+    const label = (action.selected_option as { text?: { text?: string } } | undefined)?.text?.text ?? '';
+    const task: ReplyTask = { id: taskId, name: label };
+
+    const latest = await this.latestComment(taskId);
+    await this.slack('views.update', {
+      view_id: viewId,
+      view: replyView(recipientId, task, latest, this.teamworkTokenFor(recipientId) !== null),
+    });
+  }
+
+  /** The newest comment on a task, in full — what the reminder had to cut short. */
+  private async latestComment(taskId: number): Promise<{ author: string; at: string; body: string } | null> {
+    if (!this.teamworkToken) return null;
+    try {
+      const config = getConfig();
+      const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: this.teamworkToken });
+      const comments = await client.comments(taskId);
+      const newest = comments.sort((a, b) => (a.postedAt ?? '').localeCompare(b.postedAt ?? '')).pop();
+      if (!newest) return null;
+      const person = newest.authorId ? await client.person(newest.authorId) : null;
+      const author = [person?.firstName, person?.lastName].filter(Boolean).join(' ') || 'Someone';
+      return { author, at: newest.postedAt ?? '', body: newest.body };
+    } catch (err) {
+      this.log(`could not read task ${taskId}: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Posts the reply, using that person's own Teamwork token so the comment is filed
+   * under their name. Refused outright when they have no token — a comment under the
+   * wrong name in the system of record is worse than no comment at all.
+   */
+  private async submitReply(payload: Record<string, unknown>): Promise<void> {
+    const view = payload.view as Record<string, unknown> | undefined;
+    if (!view || view.callback_id !== REPLY_CALLBACK) return;
+
+    const sub = readSubmission(view);
+    if (!sub) return;
+
+    const token = this.teamworkTokenFor(sub.recipientId);
+    if (!token) {
+      this.log(`${sub.recipientId} tried to reply without a Teamwork token — refused`);
+      return;
+    }
+
+    try {
+      const config = getConfig();
+      const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: token });
+      const id = await client.postComment(sub.taskId, sub.body);
+      this.log(`${sub.recipientId} commented on task ${sub.taskId} (comment ${id})`);
+    } catch (err) {
+      this.log(`${sub.recipientId} could not comment on task ${sub.taskId}: ${(err as Error).message}`);
+    }
+  }
+
+  /** This person's own Teamwork token, from the environment first, then the store. */
+  private teamworkTokenFor(recipientId: string): string | null {
+    if (!recipientId) return null;
+    const fromEnv = process.env[envKeyFor('TEAMWORK_USER_TOKEN', recipientId)];
+    if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim();
+    const stored = getConfig().recipients.find((r) => r.id === recipientId)?.teamworkUserToken ?? '';
+    return stored.trim().length > 0 ? stored.trim() : null;
+  }
+
+  /** One Slack Web API call with the bot token. Modals are the only user of this. */
+  private async slack(method: string, body: unknown): Promise<void> {
+    try {
+      const res = await fetch(`https://slack.com/api/${method}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.botToken}`,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json()) as { ok: boolean; error?: string };
+      if (!data.ok) this.log(`${method} failed: ${data.error ?? 'unknown'}`);
+    } catch (err) {
+      this.log(`${method} failed: ${(err as Error).message}`);
+    }
   }
 
   private async post(url: string, body: unknown): Promise<void> {

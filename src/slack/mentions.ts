@@ -380,9 +380,13 @@ export function cleanText(text: string, names: Map<string, string> = new Map()):
  * A person's Slack user token. The environment wins over the stored value, so an
  * operator can keep secrets out of the store file entirely if they want to.
  */
+/** Environment names are the recipient id upper-cased, so `shriyam-gera` reads SHRIYAM_GERA. */
+export function envKeyFor(prefix: string, recipientId: string): string {
+  return `${prefix}_${recipientId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+}
+
 export function userTokenFor(recipientId: string, stored = ''): string | null {
-  const key = `SLACK_USER_TOKEN_${recipientId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
-  const fromEnv = process.env[key];
+  const fromEnv = process.env[envKeyFor('SLACK_USER_TOKEN', recipientId)];
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim();
   return stored.trim().length > 0 ? stored.trim() : null;
 }

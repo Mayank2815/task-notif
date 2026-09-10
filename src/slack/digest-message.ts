@@ -20,16 +20,23 @@ function time(iso: string, timezone: string): string {
   }
 }
 
-/** The end-of-day recap: what you did, what still wants an answer, what landed on you. */
-export function renderDigest(digest: Digest, timezone: string, note?: string): RenderedMessage {
+/**
+ * The end-of-day recap: what you did, what still wants an answer, what landed on you.
+ * `kind` only changes the wording at the top — a week reads from the same digest as a
+ * day, because the window is the only thing that differs.
+ */
+export function renderDigest(
+  digest: Digest, timezone: string, note?: string, kind: 'day' | 'standup' | 'week' = 'day',
+): RenderedMessage {
   const name = digest.recipient.label || digest.identity.displayName;
-  const isStandup = digest.dayOffset > 0;
+  const isStandup = kind === 'standup' || (kind === 'day' && digest.dayOffset > 0);
 
   if (digest.total === 0) {
+    const quiet = kind === 'week' ? 'Nothing logged this week' : 'Nothing logged today';
     return {
       text: `No Teamwork activity logged — ${digest.dayLabel}`,
       blocks: [
-        { type: 'header', text: { type: 'plain_text', text: '🌙 Nothing logged today', emoji: true } },
+        { type: 'header', text: { type: 'plain_text', text: `🌙 ${quiet}`, emoji: true } },
         { type: 'context', elements: [{ type: 'mrkdwn', text: `${esc(digest.dayLabel)} · no comments or updates recorded in Teamwork` }] },
       ],
     };
@@ -40,7 +47,9 @@ export function renderDigest(digest: Digest, timezone: string, note?: string): R
       type: 'header',
       text: {
         type: 'plain_text',
-        text: isStandup ? `🗣️ Yesterday — ${digest.dayLabel}` : `🌙 Your day — ${digest.dayLabel}`,
+        text: kind === 'week'
+          ? `📅 Your week — ${digest.dayLabel}`
+          : isStandup ? `🗣️ Yesterday — ${digest.dayLabel}` : `🌙 Your day — ${digest.dayLabel}`,
         emoji: true,
       },
     },
@@ -48,7 +57,7 @@ export function renderDigest(digest: Digest, timezone: string, note?: string): R
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: `${isStandup ? 'For today\'s stand-up' : 'Today so far'} · ${esc(name)}${note ? `  ·  ${esc(note)}` : ''}`,
+        text: `${kind === 'week' ? 'The week in review' : isStandup ? 'For today\'s stand-up' : 'Today so far'} · ${esc(name)}${note ? `  ·  ${esc(note)}` : ''}`,
       }],
     },
   ];

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +40,7 @@ if (dashboardPassword) {
 }
 
 const scheduler = new Scheduler({ teamworkToken, slackToken });
-const socket = slackAppToken ? new SlackSocket(slackAppToken) : null;
+const socket = slackAppToken ? new SlackSocket(slackAppToken, slackToken, teamworkToken) : null;
 const undoSweeper = slackToken ? new UndoSweeper(slackToken) : null;
 app.use('/api', buildRouter({ teamworkToken, slackToken, scheduler }));
 
