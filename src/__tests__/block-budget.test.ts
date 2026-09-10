@@ -148,3 +148,80 @@ test('a heading is plain text — Slack header blocks reject mrkdwn', () => {
   assert.equal(head.text.type, 'plain_text');
   assert.ok(!head.text.text.includes('*'), 'no bold markers in a header');
 });
+
+/**
+ * What the per-row controls cost. Question rows already span two blocks, so folding their
+ * metadata up into the section leaves room for the buttons at no cost. Overdue rows are
+ * one-block one-liners and gain a second block for the date picker and Complete — that is
+ * the price of acting on them from Slack, and these tests pin exactly how big it is.
+ */
+import { renderReminder as renderForBudget } from '../slack/message.js';
+
+const budgetItem = (i: number) => ({
+  id: i,
+  task: {
+    id: 5100000 + i, name: `Task number ${i}`, projectName: 'Migrations',
+    stageName: 'Ready for QA', dueDate: '2026-09-11',
+  },
+  match: { link: 'https://tw/x', detail: `Overdue by ${i} days` },
+  assigneeNames: ['Mayank Pandey'],
+});
+const budgetGroup = (ruleId: string, label: string, n: number) => ({
+  ruleId, label, items: Array.from({ length: n }, (_, i) => budgetItem(i + 1)),
+});
+const budgetResult = (overdue: number, asks: number) => ({
+  recipient: { id: 'mayank', label: 'Mayank Pandey' },
+  identity: { displayName: 'Mayank' },
+  total: overdue + asks,
+  groups: [
+    budgetGroup('overdue', 'Overdue / due today', overdue),
+    budgetGroup('awaiting-response', 'Awaiting my response', asks),
+  ],
+}) as never;
+
+const render = (canReply: boolean, overdue = 12, asks = 12) =>
+  renderForBudget(budgetResult(overdue, asks), 'Asia/Kolkata', [], undefined, null, null, 1, canReply);
+const rowsShown = (canReply: boolean, overdue = 12, asks = 12) =>
+  render(canReply, overdue, asks).blocks.filter((b) => JSON.stringify(b).includes('dismiss_task')).length;
+
+test('question rows gain their buttons without costing a block', () => {
+  assert.equal(render(true, 0, 12).blocks.length, render(false, 0, 12).blocks.length);
+});
+
+test('an ordinary morning still shows every row with the controls on', () => {
+  // 11 overdue and 2 questions: the actual message of 11 September.
+  assert.equal(rowsShown(true, 11, 2), 13);
+});
+
+test('a full message trims four rows, and says so rather than dropping them silently', () => {
+  assert.equal(rowsShown(false), 24);
+  assert.equal(rowsShown(true), 20);
+  assert.match(JSON.stringify(render(true).blocks), /…and \d+ more/);
+});
+
+test('the controls never push a message past Slack\'s ceiling', () => {
+  assert.ok(render(true).blocks.length <= 50);
+});
+
+test('every row that is shown carries its controls', () => {
+  const actions = render(true).blocks.filter((b) => (b as { type?: string }).type === 'actions');
+  assert.equal(actions.length, rowsShown(true));
+});
+
+test('an overdue row offers a date, Complete, Comment and Hide', () => {
+  const actions = render(true, 1, 0).blocks.find((b) => (b as { type?: string }).type === 'actions') as Record<string, unknown>;
+  const kinds = (actions.elements as Record<string, unknown>[]).map((e) => e.type === 'datepicker' ? 'date' : e.action_id);
+  assert.deepEqual(kinds, ['date', 'complete_task', 'reply_task', 'dismiss_task']);
+});
+
+test('the date picker opens on the task\'s current due date', () => {
+  const actions = render(true, 1, 0).blocks.find((b) => (b as { type?: string }).type === 'actions') as Record<string, unknown>;
+  const picker = (actions.elements as Record<string, unknown>[]).find((e) => e.type === 'datepicker');
+  assert.equal(picker!.initial_date, '2026-09-11');
+});
+
+test('without a token nothing changes: one Done button per row, no controls', () => {
+  const blocks = render(false).blocks as Record<string, unknown>[];
+  assert.equal(blocks.filter((b) => b.type === 'actions').length, 0);
+  assert.ok(!JSON.stringify(blocks).includes('complete_task'));
+});

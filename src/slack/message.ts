@@ -1,7 +1,7 @@
 import { DateTime } from 'luxon';
 import type { RecipientResult } from '../pipeline.js';
 import { cleanTaskName } from '../teamwork/identity.js';
-import { replyButtonBlock } from './reply.js';
+import { taskActions } from './reply.js';
 import type { SlackMention } from './mentions.js';
 
 const MAX_ITEMS_PER_GROUP = 12;
@@ -148,7 +148,7 @@ export function renderReminder(
       { type: 'section', text: { type: 'mrkdwn', text: `${groupEmoji(group.ruleId)}  *${esc(group.label)}*  ·  ${group.items.length}` } },
     ],
     items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map((item, index) =>
-      taskRow(item, group.ruleId, index + 1, result.recipient.id)),
+      taskRow(item, group.ruleId, index + 1, result.recipient.id, canReply)),
     more: (hidden: number) => ({
       type: 'context',
       elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, group.items.length - MAX_ITEMS_PER_GROUP)} more_` }],
@@ -168,12 +168,10 @@ export function renderReminder(
     });
   }
 
-  const blocks = assembleWithBudget(intro, sections);
-  // Added after the budget is settled: a single block, and losing a task row to make
-  // room for it would be the wrong trade.
-  if (canReply && blocks.length < MAX_BLOCKS) blocks.push(replyButtonBlock(result.recipient.id));
-
-  return { text: `${totalItems} items need your attention — ${today}`, blocks };
+  return {
+    text: `${totalItems} items need your attention — ${today}`,
+    blocks: assembleWithBudget(intro, sections),
+  };
 }
 
 /** One task, numbered so it can be referred to out loud in stand-up. */
@@ -182,28 +180,33 @@ function taskRow(
   ruleId: string,
   position: number,
   recipientId: string,
+  canReply: boolean,
 ): unknown[] {
   const { task, match, assigneeNames } = item;
   const title = link(match.link, cleanTaskName(task.name));
 
-  // An accessory costs no extra block, so every row can carry a dismiss button.
-  const doneButton = {
-    type: 'button',
-    action_id: 'dismiss_task',
-    text: { type: 'plain_text', text: '✅ Done', emoji: true },
-    value: `${recipientId}|task:${task.id}|${cleanTaskName(task.name).slice(0, 60)}`.slice(0, 2000),
-  };
+  // An overdue row is fixed by moving it or finishing it; a question row by answering it.
+  // Either way the controls need the person's own token, so nothing is posted under
+  // somebody else's name — without one the row keeps its single Done button.
+  const kind = ruleId === 'overdue' ? 'update' : 'reply';
+  const actions = taskActions(recipientId, task.id, cleanTaskName(task.name), {
+    canAct: canReply, kind, dueDate: task.dueDate,
+  });
+  const doneButton = (actions.elements as Record<string, unknown>[])[0];
 
   if (ruleId === 'overdue') {
     const days = Number(/Overdue by (\d+)/i.exec(match.detail)?.[1] ?? 0);
     const age = days > 0 ? `${ageMarker(days)} ${days}d` : '🟡 today';
     const meta = [task.projectName ? esc(task.projectName) : null, task.stageName ? esc(task.stageName) : null]
       .filter(Boolean).join('  ·  ');
-    return [{
-      type: 'section',
-      text: { type: 'mrkdwn', text: `\`${position}\`  ${age}   *${title}*\n${' '.repeat(6)}${meta}` },
-      accessory: doneButton,
-    }];
+    const body = { type: 'mrkdwn', text: `\`${position}\`  ${age}   *${title}*\n${' '.repeat(6)}${meta}` };
+
+    // Costs one more block than the plain row. Measured in block-budget.test: with
+    // twelve overdue rows and twelve questions it trims four rows from a full message,
+    // which the budget absorbs with an "…and N more" line rather than dropping silently.
+    return canReply
+      ? [{ type: 'section', text: body }, actions]
+      : [{ type: 'section', text: body, accessory: doneButton }];
   }
 
   const meta = [
@@ -211,6 +214,21 @@ function taskRow(
     assigneeNames.length ? esc(assigneeNames.join(', ')) : 'unassigned',
     task.dueDate ? `due ${esc(friendlyDate(task.dueDate))}` : null,
   ].filter(Boolean).join('  ·  ');
+
+  // The metadata moves up into the section so the actions block costs nothing: the row
+  // still spans two blocks, exactly as it did with a context line underneath.
+  if (canReply) {
+    return [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `\`${position}\`  *${title}*\n>${esc(truncate(match.detail, SNIPPET_MAX))}\n${meta}`,
+        },
+      },
+      actions,
+    ];
+  }
 
   return [
     {

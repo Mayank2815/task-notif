@@ -67,7 +67,7 @@ export function renderDigest(
   if (digest.summary) {
     blocks.push({ type: 'divider' });
     // Already escaped by its builder, and carries links that esc() would break.
-    section(`*🗒️ For tomorrow's stand-up*\n${digest.summary}`);
+    section(`*🗒️ ${kind === 'week' ? 'The week in short' : "For tomorrow's stand-up"}*\n${digest.summary}`);
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_assembled from the items below_' }] });
   }
 
@@ -160,7 +160,10 @@ export function renderDigest(
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…${hidden} more block(s) trimmed to fit Slack's limit_` }] });
   }
 
-  return { text: isStandup ? `Yesterday — ${digest.dayLabel}` : `Your day — ${digest.dayLabel}`, blocks };
+  const title = kind === 'week'
+    ? `Your week — ${digest.dayLabel}`
+    : isStandup ? `Yesterday — ${digest.dayLabel}` : `Your day — ${digest.dayLabel}`;
+  return { text: title, blocks };
 }
 
 function truncate(s: string, max: number): string {

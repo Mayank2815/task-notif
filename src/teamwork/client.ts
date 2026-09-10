@@ -82,8 +82,21 @@ export class TeamworkClient {
    * every other call here is a read and safe to repeat, but a comment that may already
    * have landed must not be posted twice.
    */
-  async postComment(taskId: number, body: string): Promise<number> {
+  async postComment(
+    taskId: number,
+    body: string,
+    /**
+     * HTML is how a mention becomes a real one — Teamwork's editor stores a mention as a
+     * link to the person, and plain "@Name" text is only a word that looks like one.
+     */
+    opts: { html?: boolean; notify?: number[] } = {},
+  ): Promise<number> {
     await this.throttle();
+    const comment: Record<string, unknown> = { body, contentType: opts.html ? 'HTML' : 'TEXT' };
+    // Leaving notify out notifies nobody, which is right for a reply that tags nobody.
+    // The field takes a comma-separated list of user ids.
+    if (opts.notify?.length) comment.notify = opts.notify.join(',');
+
     const res = await fetch(`${this.base}/tasks/${taskId}/comments.json`, {
       method: 'POST',
       headers: {
@@ -91,16 +104,14 @@ export class TeamworkClient {
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      // Plain text: the reply box is a Slack input, so anything else would be a lie
-      // about what the person typed.
-      body: JSON.stringify({ comment: { body, 'content-type': 'text', notify: '' } }),
+      body: JSON.stringify({ comment }),
     });
 
     if (!res.ok) {
       throw new TeamworkError(`Teamwork ${res.status} posting a comment on task ${taskId}`, res.status, await safeText(res));
     }
-    const data = (await res.json()) as { commentId?: number | string; comment?: { id?: number | string } };
-    return Number(data.commentId ?? data.comment?.id ?? 0);
+    const data = (await res.json()) as { commentId?: number | string; comment?: { id?: number | string }; id?: number | string };
+    return Number(data.commentId ?? data.id ?? data.comment?.id ?? 0);
   }
 
   /** Walks every page of a v3 collection and returns the flattened rows plus merged sideloads. */
@@ -306,6 +317,56 @@ export class TeamworkClient {
       'comments',
     );
     return rows.map((c) => this.normaliseComment(c, taskId));
+  }
+
+  /**
+   * A task's comments with their authors attached, in one request.
+   *
+   * Looking each author up separately cost a round trip per person — measured at 2.7s
+   * for four authors on top of the comments themselves, which is the whole of the wait
+   * someone saw after clicking Reply. The users sideload carries name and avatar in the
+   * same response (0.7s).
+   */
+  async commentThread(taskId: number): Promise<{
+    comments: TeamworkComment[];
+    authors: Map<number, { name: string; avatarUrl: string | null }>;
+  }> {
+    const { rows, included } = await this.paginate<Record<string, unknown>>(
+      `/projects/api/v3/tasks/${taskId}/comments.json`,
+      'comments',
+      { include: 'users' },
+    );
+    const authors = new Map<number, { name: string; avatarUrl: string | null }>();
+    for (const [id, raw] of Object.entries(included.users ?? {})) {
+      const u = raw as Record<string, unknown>;
+      const name = [str(u.firstName), str(u.lastName)].filter(Boolean).join(' ');
+      authors.set(Number(id), { name: name || 'Someone', avatarUrl: str(u.avatarUrl) ?? null });
+    }
+    return { comments: rows.map((c) => this.normaliseComment(c, taskId)), authors };
+  }
+
+  /**
+   * Moves a task's due date, as whoever owns this client's token. Idempotent, so safe to
+   * repeat, unlike posting a comment.
+   */
+  async setDueDate(taskId: number, dueAt: string): Promise<void> {
+    await this.write('PUT', `/projects/api/v3/tasks/${taskId}.json`, { task: { dueAt } }, `moving the due date of task ${taskId}`);
+  }
+
+  /** Marks a task complete. A v1 endpoint; v3 has no equivalent. */
+  async completeTask(taskId: number): Promise<void> {
+    await this.write('PUT', `/tasks/${taskId}/complete.json`, {}, `completing task ${taskId}`);
+  }
+
+  /** One write, never retried — a write that may already have landed is not repeated blindly. */
+  private async write(method: 'PUT' | 'POST', path: string, body: unknown, what: string): Promise<void> {
+    await this.throttle();
+    const res = await fetch(`${this.base}${path}`, {
+      method,
+      headers: { Authorization: this.auth, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new TeamworkError(`Teamwork ${res.status} ${what}`, res.status, await safeText(res));
   }
 
   private normaliseTask(t: Record<string, unknown>, projects: Record<string, unknown>): TeamworkTask {
