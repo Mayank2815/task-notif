@@ -1,6 +1,6 @@
 import type { Config } from '../config/schema.js';
 import type { Digest } from '../digest.js';
-import { buildFactualSummary } from './factual-summary.js';
+import { buildFactualSummary, isStandupWork } from './factual-summary.js';
 import { generate } from './gemini.js';
 
 /**
@@ -23,6 +23,8 @@ export function buildPrompt(digest: Digest, includeDmText: boolean, slackConnect
     return `"${u.taskName}" (${u.project ?? 'no project'})${tags ? ` [${tags}]` : ''}${prs}: ${u.text}`;
   }));
 
+  add('Tasks I logged time on', (digest.timeLogged ?? []).filter(isStandupWork).map((t) =>
+    `"${t.taskName}" (${t.project ?? 'no project'}): ${Math.floor(t.minutes / 60)}h ${t.minutes % 60}m`));
   add('Tasks I completed', digest.completed.map((c) => `"${c.taskName}" (${c.project ?? 'no project'})`));
   add('Other changes I made', digest.statusChanges.map((s) => s.description));
   add('New work assigned to me today', digest.newlyAssigned.map((t) => `"${t.taskName}" (${t.project ?? 'no project'})`));

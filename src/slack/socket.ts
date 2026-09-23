@@ -1,6 +1,7 @@
 import {
   addDismissal, clearUndo, getConfig, getDismissals, removeDismissal, syncUndoMessage,
 } from '../config/store.js';
+import { teamworkTokenFor } from '../pipeline.js';
 import { TeamworkClient } from '../teamwork/client.js';
 import { PeopleDirectory } from '../teamwork/people-directory.js';
 import { cleanTaskName } from '../teamwork/identity.js';
@@ -644,7 +645,7 @@ export class SlackSocket {
     const viewId = String((opened?.view as { id?: string } | undefined)?.id ?? '');
     if (!viewId) return;
 
-    const read = await this.readTask(taskId);
+    const read = await this.readTask(taskId, routed.recipientId);
     const config = getConfig();
     await this.slack('views.update', {
       view_id: viewId,
@@ -672,13 +673,16 @@ export class SlackSocket {
    * per author in turn — 4.3s measured, nearly all of it waiting on names that the
    * comments endpoint will sideload in the same response.
    */
-  private async readTask(taskId: number): Promise<{ task: ReplyTask; thread: ThreadComment[]; total: number }> {
+  private async readTask(taskId: number, recipientId: string): Promise<{ task: ReplyTask; thread: ThreadComment[]; total: number }> {
     const empty = { task: { id: taskId, name: '' }, thread: [], total: 0 };
-    if (!this.teamworkToken) return empty;
+    const config = getConfig();
+    // Read with the person's own token where they have one: a task on a board the shared
+    // token cannot see would otherwise open to an empty thread.
+    const token = teamworkTokenFor(config, recipientId, this.teamworkToken);
+    if (!token) return empty;
 
     try {
-      const config = getConfig();
-      const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: this.teamworkToken });
+      const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: token });
       const [task, { comments, authors }] = await Promise.all([client.task(taskId), client.commentThread(taskId)]);
 
       const ordered = [...comments].sort((a, b) => (a.postedAt ?? '').localeCompare(b.postedAt ?? ''));

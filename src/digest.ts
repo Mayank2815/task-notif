@@ -63,6 +63,8 @@ export interface Digest {
   slackActivity: ChannelActivity[];
   /** Calls set up or held, from Slack. */
   meetings: MeetingMention[];
+  /** Time logged in the window, one row per task, most time first. */
+  timeLogged: { taskId: number; taskName: string; project: string | null; stage: string | null; link: string; minutes: number }[];
   /** 0 = today so far, 1 = the whole of yesterday. */
   dayOffset: number;
   /** Gemini's stand-up write-up. Null when disabled or the call failed. */
@@ -75,6 +77,15 @@ export interface DigestWorkspace {
   tasksById: Map<number, TeamworkTask>;
   usersById: Map<number, TeamworkUser>;
   activity: TeamworkActivity[];
+}
+
+/** "3h", "1h 18m", "36m" — how a duration is said at stand-up. */
+export function hoursAndMinutes(minutes: number): string {
+  const m = Math.max(0, Math.round(minutes));
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  if (h === 0) return `${rest}m`;
+  return rest === 0 ? `${h}h` : `${h}h ${rest}m`;
 }
 
 /** A weekly schedule can leave at most a six-day gap, so the walk back never needs more. */
@@ -228,6 +239,30 @@ export async function buildDigest(
     }
   }
 
+  // A task the sweep did not index — the sweep holds open tasks, so usually one already
+  // closed — used to read as a bare "Task <id>". Six of one person's seven tasks read that
+  // way on 14 September, with every token tried. Ask Teamwork for the few that are missing.
+  const unnamed = [...new Set([...updates, ...mentionsOpen, ...mentionsAnswered]
+    .filter((e) => !ws.tasksById.has(e.taskId)).map((e) => e.taskId))];
+  if (unnamed.length > 0) {
+    try {
+      const found = new Map(
+        (await Promise.all(unnamed.map((id) => client.task(id).catch(() => null))))
+          .filter((t): t is TeamworkTask => Boolean(t))
+          .map((t) => [t.id, t]),
+      );
+      for (const e of [...updates, ...mentionsOpen, ...mentionsAnswered]) {
+        const t = found.get(e.taskId);
+        if (!t) continue;
+        e.taskName = t.name;
+        e.project = t.projectName ?? e.project;
+        if ('taskLink' in e) e.taskLink = t.url;
+      }
+    } catch (err) {
+      console.warn(`[digest] could not name ${unnamed.length} task(s) for ${recipient.label}: ${(err as Error).message}`);
+    }
+  }
+
   // Activity the person performed today. Comment activity is dropped — the updates
   // section above already covers it, keyed on item.type rather than the id (a comment
   // activity's itemId is the comment's, not the task's).
@@ -256,6 +291,31 @@ export async function buildDigest(
       link: a.itemType === 'tasks' ? taskLink(a.itemId) : null,
     }));
 
+  // Time is the surest trace of work: a whole afternoon on a task can leave no comment at
+  // all. Reading comments alone hid seven of one person's eight tasks, about eight hours,
+  // from the Monday stand-up of 14 September.
+  let timeLogged: Digest['timeLogged'] = [];
+  try {
+    const byTask = new Map<number, Digest['timeLogged'][number]>();
+    for (const t of await client.timeLoggedBy(identity.userId, startIso, endIso)) {
+      const known = ws.tasksById.get(t.taskId);
+      const entry = byTask.get(t.taskId) ?? {
+        taskId: t.taskId,
+        taskName: known?.name ?? t.taskName ?? `Task ${t.taskId}`,
+        project: known?.projectName ?? t.projectName ?? null,
+        stage: known?.stageName ?? null,
+        link: known?.url ?? taskLink(t.taskId) ?? '',
+        minutes: 0,
+      };
+      entry.minutes += t.minutes;
+      byTask.set(t.taskId, entry);
+    }
+    timeLogged = [...byTask.values()].sort((a, b) => b.minutes - a.minutes);
+  } catch (err) {
+    // The comment half is still worth sending; say why the time half is missing.
+    console.warn(`[digest] time logs unavailable for ${recipient.label}: ${(err as Error).message}`);
+  }
+
   // Work that landed on them today — the ad-hoc/priority items standup asks about.
   const newlyAssigned = [...ws.tasksById.values()]
     .filter((t) => t.assigneeIds.includes(identity.userId))
@@ -283,12 +343,13 @@ export async function buildDigest(
     slackAwaiting: slackMentions.filter((m) => !m.answered),
     slackActivity,
     meetings,
+    timeLogged,
     dayOffset,
     summary: null,
     total:
       updates.length + mentionsAnswered.length + mentionsOpen.length +
       completed.length + statusChanges.length + newlyAssigned.length + slackMentions.length +
-      slackActivity.length + meetings.length,
+      slackActivity.length + meetings.length + timeLogged.length,
   };
 }
 

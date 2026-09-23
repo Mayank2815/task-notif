@@ -4,6 +4,7 @@ import { getDismissals } from './config/store.js';
 import { activeRules } from './rules/index.js';
 import type { RuleContext, RuleMatch } from './rules/types.js';
 import { buildIdentity, mentionsIdentity, type Identity } from './teamwork/identity.js';
+import { envKeyFor } from './slack/mentions.js';
 import { TeamworkClient } from './teamwork/client.js';
 import { stageIdsInRange } from './teamwork/stage-range.js';
 import type { TeamworkComment, TeamworkTask, TeamworkUser } from './teamwork/types.js';
@@ -22,10 +23,16 @@ export interface RecipientResult {
   total: number;
 }
 
+/** A person's view of Teamwork: a client on the token they are read with, and its sweep. */
+export interface TokenContext {
+  client: TeamworkClient;
+  workspace: Workspace;
+}
+
 export interface ScanResult {
   results: RecipientResult[];
-  /** Reused by the caller so a second full sweep is never needed. */
-  workspace: Workspace;
+  /** Each own-list recipient's view, reused by the caller so no second sweep is needed. */
+  contexts: Map<string, TokenContext>;
   stats: {
     commentsSwept: number;
     tasksIndexed: number;
@@ -45,6 +52,50 @@ export interface Workspace {
   /** workflowId -> stageId -> column name. Tasks fetched outside the sweep need this too. */
   stageNames: Map<number, Map<number, string>>;
   commentCount: number;
+}
+
+/**
+ * The token a person's Teamwork data is read with: their own when they have given one,
+ * otherwise the shared one. Teamwork shows a token only the projects its owner can see,
+ * so reading everyone through one person's token hid whole boards — a recipient working
+ * on a DevOps board came back as "nothing recorded" on 14 September, while her own token
+ * found the time she logged and the tasks she closed.
+ */
+export function teamworkTokenFor(config: Config, recipientId: string, shared: string): string {
+  const fromEnv = process.env[envKeyFor('TEAMWORK_USER_TOKEN', recipientId)]?.trim();
+  if (fromEnv) return fromEnv;
+  const stored = config.recipients.find((r) => r.id === recipientId)?.teamworkUserToken.trim() ?? '';
+  return stored || shared;
+}
+
+/**
+ * One sweep per distinct token, all at once, shared by everyone read with that token.
+ * Measured on 14 September: four tokens swept in parallel took 71 seconds end to end;
+ * one after another it is over three minutes, inside a run that gives up at twelve.
+ * Tokens only ever key this map in memory — they are never logged.
+ */
+export async function workspacesByToken(
+  config: Config,
+  sharedToken: string,
+  recipients: Recipient[],
+  log: (m: string) => void,
+  lookbackDays = config.lookbackDays,
+): Promise<Map<string, TokenContext>> {
+  const groups = new Map<string, Recipient[]>();
+  for (const r of recipients) {
+    const token = teamworkTokenFor(config, r.id, sharedToken);
+    groups.set(token, [...(groups.get(token) ?? []), r]);
+  }
+
+  const byRecipient = new Map<string, TokenContext>();
+  await Promise.all([...groups].map(async ([token, members]) => {
+    const client = new TeamworkClient({ siteUrl: config.teamworkSiteUrl, apiToken: token, lookbackDays });
+    const who = members.map((m) => m.label || m.id).join(', ');
+    const workspace = await collectWorkspace(client, (m) => log(`[${who}] ${m}`), config);
+    const context: TokenContext = { client, workspace };
+    for (const m of members) byRecipient.set(m.id, context);
+  }));
+  return byRecipient;
 }
 
 export function makeClient(config: Config, apiToken: string): TeamworkClient {
@@ -256,15 +307,15 @@ async function evaluateRecipient(
 
 export async function runScan(config: Config, apiToken: string, log: (m: string) => void = () => {}): Promise<ScanResult> {
   const started = Date.now();
-  const client = makeClient(config, apiToken);
-  const ws = await collectWorkspace(client, log, config);
-
   const active = config.recipients.filter((r) => r.enabled);
-  const results: RecipientResult[] = [];
+  const own = active.filter((r) => !r.mirrorOf);
+  const contexts = await workspacesByToken(config, apiToken, own, log);
 
+  const results: RecipientResult[] = [];
   // Own-list recipients first, so mirrors can copy a result that already exists.
-  for (const recipient of active.filter((r) => !r.mirrorOf)) {
-    results.push(await evaluateRecipient(client, ws, config, recipient, log));
+  for (const recipient of own) {
+    const { client, workspace } = contexts.get(recipient.id)!;
+    results.push(await evaluateRecipient(client, workspace, config, recipient, log));
   }
   for (const recipient of active.filter((r) => r.mirrorOf)) {
     const source = results.find((r) => r.recipient.id === recipient.mirrorOf);
@@ -275,10 +326,15 @@ export async function runScan(config: Config, apiToken: string, log: (m: string)
     results.push({ ...source, recipient });
   }
 
+  const sweeps = [...new Set([...contexts.values()].map((c) => c.workspace))];
   return {
     results,
-    workspace: ws,
-    stats: { commentsSwept: ws.commentCount, tasksIndexed: ws.tasksById.size, durationMs: Date.now() - started },
+    contexts,
+    stats: {
+      commentsSwept: sweeps.reduce((n, w) => n + w.commentCount, 0),
+      tasksIndexed: sweeps.reduce((n, w) => n + w.tasksById.size, 0),
+      durationMs: Date.now() - started,
+    },
   };
 }
 

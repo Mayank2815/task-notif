@@ -3,8 +3,9 @@ import type { Config, JobKind } from './config/schema.js';
 import { getDismissals, recordRun } from './config/store.js';
 import { buildDigest, standupWindow } from './digest.js';
 import { writeStandupSummary } from './llm/standup.js';
-import { collectWorkspace, makeClient, runScan, type ScanResult } from './pipeline.js';
+import { runScan, workspacesByToken, type ScanResult, type TokenContext } from './pipeline.js';
 import { SlackClient } from './slack/client.js';
+import type { TeamworkActivity } from './teamwork/types.js';
 import { renderDigest } from './slack/digest-message.js';
 import { renderReminder } from './slack/message.js';
 import {
@@ -68,7 +69,13 @@ export async function runAndDeliver(
     }
   }
 
-  const messages: { recipient: Config['recipients'][number]; total: number; rendered: ReturnType<typeof renderReminder> }[] = [];
+  const messages: {
+    recipient: Config['recipients'][number];
+    total: number;
+    rendered: ReturnType<typeof renderReminder>;
+    /** A stand-up is worth sending even when the list under it is empty. */
+    hasStandup?: boolean;
+  }[] = [];
   let scan: ScanResult | null = null;
 
   if (job === 'reminder') {
@@ -78,17 +85,14 @@ export async function runAndDeliver(
     // spans yesterday, so yesterday's mentions are filtered out of the same result
     // rather than fetched again. Doing it twice roughly doubled a run that was
     // already the slowest thing here.
-    const client = makeClient(config, teamworkToken);
     const wantYesterday = config.includeYesterdayInReminder;
     // On a Monday this spans Friday to Sunday, so the weekend is never skipped.
     const span = standupWindow(config);
     const dayOffsets = Array.from({ length: span.days }, (_, i) => i + 1);
     if (wantYesterday && span.days > 1) log(`stand-up covers ${span.days} days: ${span.label}`);
 
-    const ws = wantYesterday ? scan.workspace : null;
-    const activity = wantYesterday
-      ? await client.activitySince(span.start.toUTC().toISO() ?? '').catch(recordFailure)
-      : [];
+    // Activity is read per token as well: each sees only the projects its owner can.
+    const activityOf = activityPerToken(span.start.toUTC().toISO() ?? '');
 
     for (const result of scan.results) {
       const r = result.recipient;
@@ -98,14 +102,16 @@ export async function runAndDeliver(
       const awaiting = pending.filter((m) => !m.answered);
 
       let summary: string | null = null;
-      if (wantYesterday && ws) {
+      const context = scan.contexts.get(r.id) ?? (r.mirrorOf ? scan.contexts.get(r.mirrorOf) : undefined);
+      if (wantYesterday && context) {
+        const activity = await activityOf(context).catch(recordFailure);
         const mentions = pending.filter((m) => {
           const at = DateTime.fromISO(m.at);
           return at >= span.start && at <= span.end;
         });
         const { activity: slackActivity, meetings } = await slackDayFor(config, r.id, dayOffsets, log, names);
         const digest = await buildDigest(
-          client, { ...ws, activity }, config, r, DateTime.now(), mentions, 1, slackActivity, meetings, span.days,
+          context.client, { ...context.workspace, activity }, config, r, DateTime.now(), mentions, 1, slackActivity, meetings, span.days,
         );
         summary = await writeStandupSummary(
           digest, config, (m) => log(`${r.label}: ${m}`), slackConnectedFor(config, r.id),
@@ -116,6 +122,7 @@ export async function runAndDeliver(
       messages.push({
         recipient: r,
         total: result.total + awaiting.length,
+        hasStandup: Boolean(summary),
         rendered: renderReminder(
           result, config.timezone, awaiting, note, summary, span.label, span.days, canReplyAs(config, r.id),
         ),
@@ -127,17 +134,19 @@ export async function runAndDeliver(
     // instead of silently reaching back into the previous week.
     const local = DateTime.now().setZone(config.timezone);
     const spanDays = local.weekday;
-    const client = makeClient(config, teamworkToken);
-    const ws = await collectWorkspace(client, log, config).catch(recordFailure);
     const weekStart = local.startOf('day').minus({ days: spanDays - 1 });
-    const activity = await client.activitySince(weekStart.toUTC().toISO() ?? '').catch(recordFailure);
+    const recipients = config.recipients.filter((r) => r.enabled);
+    const contexts = await workspacesByToken(config, teamworkToken, recipients, log).catch(recordFailure);
+    const activityOf = activityPerToken(weekStart.toUTC().toISO() ?? '');
     log(`week in review: ${spanDays} day(s) from ${weekStart.toFormat('cccc, d LLLL')}`);
 
-    for (const recipient of config.recipients.filter((r) => r.enabled)) {
+    for (const recipient of recipients) {
+      const context = contexts.get(recipient.id)!;
+      const activity = await activityOf(context).catch(recordFailure);
       // Slack is left out: its search answers a day at a time, so a whole week would
       // cost five more round trips per person for a line nobody reads on a Friday.
       const digest = await buildDigest(
-        client, { ...ws, activity }, config, recipient, DateTime.now(), [], 0, [], [], spanDays,
+        context.client, { ...context.workspace, activity }, config, recipient, DateTime.now(), [], 0, [], [], spanDays,
       );
       digest.summary = await writeStandupSummary(
         digest, config, (m) => log(`${recipient.label}: ${m}`), false,
@@ -152,18 +161,17 @@ export async function runAndDeliver(
   } else {
     // The evening digest covers today so far. Yesterday is reported by the morning
     // reminder instead, so there is one message per half of the day rather than three.
-    const client = makeClient(config, teamworkToken);
-    const ws = await collectWorkspace(client, log, config).catch(recordFailure);
-    const activity = await client
-      .activitySince(DateTime.now().setZone(config.timezone).startOf('day').toUTC().toISO() ?? '')
-      .catch(recordFailure);
-    log(`fetched ${activity.length} activity entries for today`);
+    const recipients = config.recipients.filter((r) => r.enabled);
+    const contexts = await workspacesByToken(config, teamworkToken, recipients, log).catch(recordFailure);
+    const activityOf = activityPerToken(DateTime.now().setZone(config.timezone).startOf('day').toUTC().toISO() ?? '');
 
-    for (const recipient of config.recipients.filter((r) => r.enabled)) {
+    for (const recipient of recipients) {
+      const context = contexts.get(recipient.id)!;
+      const activity = await activityOf(context).catch(recordFailure);
       const mentions = await slackMentionsFor(config, recipient.id, 'today', log, names);
       const { activity: slackActivity, meetings } = await slackDayFor(config, recipient.id, [0], log, names);
       const digest = await buildDigest(
-        client, { ...ws, activity }, config, recipient, DateTime.now(), mentions, 0, slackActivity, meetings,
+        context.client, { ...context.workspace, activity }, config, recipient, DateTime.now(), mentions, 0, slackActivity, meetings,
       );
       digest.summary = await writeStandupSummary(
         digest, config, (m) => log(`${recipient.label}: ${m}`), slackConnectedFor(config, recipient.id),
@@ -176,9 +184,9 @@ export async function runAndDeliver(
     }
   }
 
-  for (const { recipient: r, total, rendered } of messages) {
+  for (const { recipient: r, total, rendered, hasStandup } of messages) {
     try {
-      if (total === 0 && !config.sendWhenEmpty) {
+      if (nothingToSend(total, hasStandup ?? false, config.sendWhenEmpty)) {
         log(`${r.label}: nothing to report, skipping (sendWhenEmpty is off)`);
         perRecipient.push({ id: r.id, matched: 0, delivered: false, error: null });
         continue;
@@ -188,7 +196,16 @@ export async function runAndDeliver(
       if (!target) throw new Error(`no Slack target — set slackTarget, or an email Slack knows`);
 
       await slack.postMessage(target, rendered.text, rendered.blocks, rendered.attachments ?? []);
-      log(`${r.label}: delivered ${job} (${total} item(s)) to ${target}`);
+      const parts = 1 + (rendered.continuation?.length ?? 0);
+      // The rest goes straight after, in order; naming the part keeps a failure findable.
+      for (const [i, part] of (rendered.continuation ?? []).entries()) {
+        try {
+          await slack.postMessage(target, part.text, part.blocks);
+        } catch (err) {
+          throw new Error(`part ${i + 2} of ${parts}: ${(err as Error).message}`);
+        }
+      }
+      log(`${r.label}: delivered ${job} (${total} item(s))${parts > 1 ? ` in ${parts} messages` : ''} to ${target}`);
       perRecipient.push({ id: r.id, matched: total, delivered: true, error: null });
     } catch (err) {
       const message = (err as Error).message;
@@ -290,6 +307,28 @@ export function mergeChannelActivity(days: ChannelActivity[][]): ChannelActivity
     }
   }
   return [...byChannel.values()];
+}
+
+/**
+ * Fetches the activity feed once per token, however many people share it. Keyed on the
+ * context object, which everyone read with the same token shares.
+ */
+function activityPerToken(since: string): (context: TokenContext) => Promise<TeamworkActivity[]> {
+  const fetched = new Map<TokenContext, Promise<TeamworkActivity[]>>();
+  return (context) => {
+    if (!fetched.has(context)) fetched.set(context, context.client.activitySince(since));
+    return fetched.get(context)!;
+  };
+}
+
+/**
+ * Whether a person gets no message at all. An empty list is not enough on its own: someone
+ * who cleared every item still has yesterday's stand-up to read out. Deciding on the list
+ * alone would have left one person with no stand-up on 15 September, after they moved or
+ * hid everything on their list the morning before.
+ */
+export function nothingToSend(items: number, hasStandup: boolean, sendWhenEmpty: boolean): boolean {
+  return items === 0 && !hasStandup && !sendWhenEmpty;
 }
 
 /**

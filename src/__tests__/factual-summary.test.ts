@@ -107,18 +107,21 @@ test('a quiet day says nothing is outstanding rather than inventing work', () =>
   assert.match(buildFactualSummary({ ...base, updates: [update()] } as unknown as Digest)!, /nothing waiting on a reply/);
 });
 
-test('a long task list is truncated politely', () => {
+test('a long task list names every task — stand-up goes through each one', () => {
   const digest = { ...base, updates: Array.from({ length: 7 }, (_, i) => update({ taskId: i, taskName: `Task ${i}` })) } as unknown as Digest;
-  assert.match(buildFactualSummary(digest)!, /\+3 more/);
+  const summary = buildFactualSummary(digest)!;
+  for (let i = 0; i < 7; i++) assert.match(summary, new RegExp(`Task ${i}`));
+  assert.ok(!/Worked on[^\n]*\+\d+ more/.test(summary));
 });
 
 test('an empty digest produces no summary at all', () => {
   assert.equal(buildFactualSummary(base), null);
 });
 
-test('every line is a bullet, ready to paste into stand-up', () => {
+test('every entry is a bullet, and the tasks under Worked on are indented lines', () => {
   const summary = buildFactualSummary({ ...base, updates: [update()] } as unknown as Digest)!;
-  assert.ok(summary.split('\n').every((l) => l.startsWith('• ')));
+  assert.ok(summary.split('\n').every((l) => l.startsWith('• ') || l.startsWith('      ◦ ')));
+  assert.ok(summary.startsWith('• '));
 });
 
 test('two comments on one task count as one task', () => {
@@ -145,6 +148,57 @@ test('the blocked line de-duplicates too', () => {
     ],
   } as unknown as Digest;
   assert.equal(buildFactualSummary(digest)!.match(/Stuck thing/g)!.length, 2); // once in Worked on, once in Blocked
+});
+
+test('two open comments on one task list the task once in Still open', () => {
+  // 14 September: two unanswered comments from one person on one task read out twice.
+  const ask = (at: string, author = 'Asha') =>
+    ({ taskId: 1001, taskName: 'Convert media service *', link: `https://tw/app/tasks/1001?c=${at}`, author, stage: null, at });
+  const digest = {
+    ...base,
+    mentionsOpen: [
+      ask('1'), ask('2'), ask('3', 'Ravi'),
+      { taskId: 1002, taskName: 'listAll method', link: 'https://tw/app/tasks/1002', author: 'Asha', stage: null, at: '4' },
+    ],
+  } as unknown as Digest;
+  const open = buildFactualSummary(digest)!.split('\n').find((l) => l.includes('Still open'))!;
+  assert.equal(open.match(/Convert media service/g)!.length, 1);
+  assert.match(open, /Convert media service> \(Asha, Ravi\)/, 'everyone who asked is still named');
+  assert.match(open, /listAll method/);
+  assert.ok(!open.includes('more'));
+});
+
+test('replies in one place are one Answered entry, and the count says so', () => {
+  const digest = {
+    ...base,
+    mentionsAnswered: [
+      { taskId: 5, author: 'Dev', taskName: 'Report permissions', link: 'https://tw/1', stage: null },
+      { taskId: 5, author: 'Dev', taskName: 'Report permissions', link: 'https://tw/2', stage: null },
+    ],
+    slackReplied: [
+      { author: 'Nina', isDm: false, channelName: 'mobile_app', permalink: 'https://s/1' },
+      { author: 'Nina', isDm: false, channelName: 'mobile_app', permalink: 'https://s/2' },
+      { author: 'Leo', isDm: true, channelName: 'x', permalink: 'https://s/3' },
+    ],
+  } as unknown as Digest;
+  const summary = buildFactualSummary(digest)!;
+  assert.match(summary, /Answered 3\*/);
+  assert.equal(summary.match(/#mobile_app/g)!.length, 1);
+  assert.equal(summary.match(/Report permissions/g)!.length, 1);
+  assert.match(summary, /Leo in <https:\/\/s\/3\|DM>/);
+});
+
+test('DMs from two different people stay two entries', () => {
+  const digest = {
+    ...base,
+    slackAwaiting: [
+      { author: 'Omar', isDm: true, channelName: 'D1', permalink: 'https://s/1' },
+      { author: 'Ivy', isDm: true, channelName: 'D2', permalink: 'https://s/2' },
+    ],
+  } as unknown as Digest;
+  const summary = buildFactualSummary(digest)!;
+  assert.match(summary, /DM from Omar/);
+  assert.match(summary, /DM from Ivy/);
 });
 
 test('the summary names where you talked and which calls happened', () => {

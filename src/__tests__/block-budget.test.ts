@@ -193,16 +193,23 @@ test('an ordinary morning still shows every row with the controls on', () => {
   assert.equal(rowsShown(true, 11, 2), 13);
 });
 
-test('a full message trims four rows, and says so rather than dropping them silently', () => {
-  assert.equal(rowsShown(false), 24);
-  assert.equal(rowsShown(true), 20);
-  assert.match(JSON.stringify(render(true).blocks), /…and \d+ more/);
+test('a full message loses no row: what does not fit arrives as a second message', () => {
+  const msg = render(true);
+  assert.ok(msg.continuation?.length, 'twelve overdue rows and twelve questions need a second message');
+  const everything = JSON.stringify([msg.blocks, ...msg.continuation!.map((c) => c.blocks)]);
+  assert.equal((everything.match(/"dismiss_task"/g) ?? []).length, 24, 'all 24 rows, not 20');
+  assert.ok(!/…and \d+ more/.test(everything), 'nothing is summarised away');
 });
 
-test('the controls never push a message past Slack\'s ceiling', () => {
-  assert.ok(render(true).blocks.length <= 50);
+test('more than twelve in a group are all sent — there is no longer a cap', () => {
+  const msg = render(true, 30, 0);
+  const everything = JSON.stringify([msg.blocks, ...(msg.continuation ?? []).map((c) => c.blocks)]);
+  assert.equal((everything.match(/"dismiss_task"/g) ?? []).length, 30);
 });
-
+test('no single message goes past Slack\'s ceiling', () => {
+  const msg = render(true);
+  for (const part of [msg.blocks, ...(msg.continuation ?? []).map((c) => c.blocks)]) assert.ok(part.length <= 50);
+});
 test('every row that is shown carries its controls', () => {
   const actions = render(true).blocks.filter((b) => (b as { type?: string }).type === 'actions');
   assert.equal(actions.length, rowsShown(true));

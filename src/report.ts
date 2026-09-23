@@ -1,8 +1,8 @@
 import { DateTime } from 'luxon';
 import type { Config } from './config/schema.js';
 import { buildDigest } from './digest.js';
-import { collectWorkspace } from './pipeline.js';
-import { TeamworkClient } from './teamwork/client.js';
+import { workspacesByToken, type TokenContext } from './pipeline.js';
+import type { TeamworkActivity } from './teamwork/types.js';
 
 /** A day of slack, so a report that ends today still sweeps far enough back. */
 const LOOKBACK_PADDING_DAYS = 2;
@@ -12,8 +12,10 @@ export interface ReportPerson {
   label: string;
   /** Tasks closed inside the window. */
   completed: { taskId: number; taskName: string; project: string | null; link: string; at: string }[];
-  /** Distinct tasks they wrote on, however many comments each took. */
-  workedOn: { taskId: number; taskName: string; project: string | null; link: string }[];
+  /** Distinct tasks they commented on or logged time on, most time first. */
+  workedOn: { taskId: number; taskName: string; project: string | null; link: string; minutes: number }[];
+  /** All time logged in the window — for an appraisal, the plainest measure of effort. */
+  totalMinutes: number;
   /** Every comment counted, which is the effort behind workedOn. */
   comments: number;
   /** Moves, edits and completions recorded against them in the activity feed. */
@@ -77,30 +79,37 @@ export async function buildRangeReport(
   // The client's own cutoff bounds every sweep, so it has to reach past the window's
   // first day rather than use the thirty days the daily run is tuned for.
   const lookbackDays = dayOffset + spanDays + LOOKBACK_PADDING_DAYS;
-  const client = new TeamworkClient({
-    siteUrl: config.teamworkSiteUrl,
-    apiToken: teamworkToken,
-    lookbackDays,
-  });
-
   log(`reading ${spanDays} day(s) up to ${to} — sweeping ${lookbackDays} days of Teamwork`);
-  const ws = await collectWorkspace(client, log, config);
+  const recipients = config.recipients.filter((r) => r.enabled);
+  // Each person through their own token where they have given one: a board the shared
+  // token cannot see would otherwise report its whole team as having done nothing.
+  const contexts = await workspacesByToken(config, teamworkToken, recipients, log, lookbackDays);
 
   const since = DateTime.fromISO(from, { zone: config.timezone }).startOf('day').toUTC().toISO() ?? '';
-  const activity = await client.activitySince(since);
-  log(`fetched ${activity.length} activity entries`);
+  const activityBy = new Map<TokenContext, TeamworkActivity[]>();
+  for (const context of new Set(contexts.values())) activityBy.set(context, await context.client.activitySince(since));
+  log(`fetched ${[...activityBy.values()].reduce((n, a) => n + a.length, 0)} activity entries`);
 
   const people: ReportPerson[] = [];
-  for (const recipient of config.recipients.filter((r) => r.enabled)) {
+  for (const recipient of recipients) {
+    const context = contexts.get(recipient.id)!;
     // No Slack: a report over past months cannot honestly include it.
     const digest = await buildDigest(
-      client, { ...ws, activity }, config, recipient, now, [], dayOffset, [], [], spanDays,
+      context.client, { ...context.workspace, activity: activityBy.get(context)! }, config, recipient, now, [], dayOffset, [], [], spanDays,
     );
 
     const byTask = new Map<number, ReportPerson['workedOn'][number]>();
     for (const u of digest.updates) {
-      byTask.set(u.taskId, { taskId: u.taskId, taskName: u.taskName, project: u.project, link: u.taskLink });
+      byTask.set(u.taskId, { taskId: u.taskId, taskName: u.taskName, project: u.project, link: u.taskLink, minutes: 0 });
     }
+    // Logged time is work in its own right: an afternoon of code often leaves no comment,
+    // and an appraisal that counted only comments would miss it the same way the stand-up did.
+    for (const t of digest.timeLogged) {
+      const seen = byTask.get(t.taskId);
+      if (seen) seen.minutes = t.minutes;
+      else byTask.set(t.taskId, { taskId: t.taskId, taskName: t.taskName, project: t.project, link: t.link, minutes: t.minutes });
+    }
+    const totalMinutes = digest.timeLogged.reduce((n, t) => n + t.minutes, 0);
 
     people.push({
       recipientId: recipient.id,
@@ -108,21 +117,22 @@ export async function buildRangeReport(
       completed: digest.completed.map((c) => ({
         taskId: c.taskId, taskName: c.taskName, project: c.project, link: c.link, at: c.at,
       })),
-      workedOn: [...byTask.values()],
+      workedOn: [...byTask.values()].sort((a, b) => b.minutes - a.minutes),
+      totalMinutes,
       comments: digest.updates.length,
       statusChanges: digest.statusChanges.length,
       newlyAssigned: digest.newlyAssigned.map((t) => ({
         taskId: t.taskId, taskName: t.taskName, project: t.project, link: t.link,
       })),
     });
-    log(`${recipient.label}: ${digest.completed.length} closed, ${byTask.size} tasks touched`);
+    log(`${recipient.label}: ${digest.completed.length} closed, ${byTask.size} tasks touched, ${Math.round(totalMinutes / 60)}h logged`);
   }
 
   return {
     from, to, days: spanDays, people, source: 'teamwork',
     stats: {
-      commentsSwept: [...ws.commentsByTask.values()].reduce((n, list) => n + list.length, 0),
-      activityEntries: activity.length,
+      commentsSwept: [...activityBy.keys()].reduce((n, c) => n + c.workspace.commentCount, 0),
+      activityEntries: [...activityBy.values()].reduce((n, a) => n + a.length, 0),
       durationMs: Date.now() - started,
     },
   };

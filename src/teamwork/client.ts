@@ -369,6 +369,44 @@ export class TeamworkClient {
     if (!res.ok) throw new TeamworkError(`Teamwork ${res.status} ${what}`, res.status, await safeText(res));
   }
 
+  /**
+   * Time a person logged between two instants, one row per entry.
+   *
+   * `assignedToUserIds` is the filter that works on this endpoint: `userId`, `userIds` and
+   * `personId` are ignored without an error and return everybody's time. Checked on
+   * 14 September against a client-side count for five people — identical sets. The date
+   * filter works by whole UTC day, so the exact window is applied here afterwards, and
+   * rows are still checked against the person, in case the filter ever changes meaning.
+   */
+  async timeLoggedBy(userId: number, startIso: string, endIso: string): Promise<{
+    taskId: number; minutes: number; at: string; taskName: string | null; projectName: string | null;
+  }[]> {
+    const { rows, included } = await this.paginate<Record<string, unknown>>('/projects/api/v3/time.json', 'timelogs', {
+      assignedToUserIds: userId,
+      startDate: startIso.slice(0, 10),
+      endDate: endIso.slice(0, 10),
+      include: 'tasks,projects',
+    });
+    const tasks = (included.tasks ?? {}) as Record<string, Record<string, unknown>>;
+    const projects = (included.projects ?? {}) as Record<string, Record<string, unknown>>;
+    const from = Date.parse(startIso);
+    const to = Date.parse(endIso);
+
+    return rows
+      .filter((r) => Number(r.userId) === userId && Number(r.taskId) > 0 && !r.deleted)
+      .map((r) => ({
+        taskId: Number(r.taskId),
+        minutes: Number(r.minutes ?? 0) + Number(r.hours ?? 0) * 60,
+        at: String(r.timeLogged ?? ''),
+        taskName: str(tasks[String(r.taskId)]?.name) ?? null,
+        projectName: str(projects[String(r.projectId)]?.name) ?? null,
+      }))
+      .filter((r) => {
+        const at = Date.parse(r.at);
+        return Number.isFinite(at) && at >= from && at <= to;
+      });
+  }
+
   private normaliseTask(t: Record<string, unknown>, projects: Record<string, unknown>): TeamworkTask {
     const id = Number(t.id);
     const tasklistMeta = (t.tasklist as Record<string, unknown> | undefined)?.meta as Record<string, unknown> | undefined;

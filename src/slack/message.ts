@@ -1,11 +1,10 @@
 import { DateTime } from 'luxon';
 import type { RecipientResult } from '../pipeline.js';
 import { cleanTaskName } from '../teamwork/identity.js';
+import { paginate } from './paginate.js';
 import { taskActions } from './reply.js';
 import type { SlackMention } from './mentions.js';
 
-const MAX_ITEMS_PER_GROUP = 12;
-const MAX_SLACK_ROWS = 8;
 const SNIPPET_MAX = 180;
 /** Slack rejects the whole message past 50 blocks, so the budget is enforced, not hoped for. */
 export const MAX_BLOCKS = 50;
@@ -73,6 +72,8 @@ export interface RenderedMessage {
   blocks: unknown[];
   /** Coloured groups. Slack only exposes colour through attachments. */
   attachments?: unknown[];
+  /** Further messages, sent straight after, when everything would not fit in one. */
+  continuation?: { text: string; blocks: unknown[] }[];
 }
 
 /** One colour per reason, so urgency reads before the words do. */
@@ -133,13 +134,19 @@ export function renderReminder(
   // Yesterday first: it is the half you read out, and stand-up comes before the day's work.
   if (yesterdaySummary) {
     intro.push(sectionHeading(`🗣️ ${standupTitle} — ${yesterdayLabel}`));
-    intro.push({ type: 'section', text: { type: 'mrkdwn', text: yesterdaySummary } });
+    intro.push(...summarySections(yesterdaySummary));
     intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_for stand-up_' }] });
   }
 
   intro.push({ type: 'divider' });
-  intro.push(sectionHeading(`📋 Needs you today · ${totalItems}`));
-  intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: tally }] });
+  if (totalItems === 0) {
+    // Only reached with a stand-up to send and an empty list under it. The tally would be
+    // an empty line, and Slack rejects a block with empty text — and the whole message with it.
+    intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '✅ _Nothing needs you today._' }] });
+  } else {
+    intro.push(sectionHeading(`📋 Needs you today · ${totalItems}`));
+    intro.push({ type: 'context', elements: [{ type: 'mrkdwn', text: tally }] });
+  }
 
   const sections: BlockSection[] = result.groups.map((group) => ({
     // Top level, not inside an attachment: Slack only renders a header block large
@@ -147,11 +154,11 @@ export function renderReminder(
     header: [
       { type: 'section', text: { type: 'mrkdwn', text: `${groupEmoji(group.ruleId)}  *${esc(group.label)}*  ·  ${group.items.length}` } },
     ],
-    items: group.items.slice(0, MAX_ITEMS_PER_GROUP).map((item, index) =>
+    items: group.items.map((item, index) =>
       taskRow(item, group.ruleId, index + 1, result.recipient.id, canReply)),
     more: (hidden: number) => ({
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, group.items.length - MAX_ITEMS_PER_GROUP)} more_` }],
+      elements: [{ type: 'mrkdwn', text: `_…and ${hidden} more_` }],
     }),
   }));
 
@@ -160,18 +167,21 @@ export function renderReminder(
       header: [
         { type: 'section', text: { type: 'mrkdwn', text: `💬  *Slack — still unanswered*  ·  ${slackAwaiting.length}` } },
       ],
-      items: slackAwaiting.slice(0, MAX_SLACK_ROWS).map((m) => slackRow(m, result.recipient.id)),
+      items: slackAwaiting.map((m) => slackRow(m, result.recipient.id)),
       more: (hidden: number) => ({
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: `_…and ${hidden + Math.max(0, slackAwaiting.length - MAX_SLACK_ROWS)} more_` }],
+        elements: [{ type: 'mrkdwn', text: `_…and ${hidden} more_` }],
       }),
     });
   }
 
-  return {
-    text: `${totalItems} items need your attention — ${today}`,
-    blocks: assembleWithBudget(intro, sections),
-  };
+  // Every row is sent. Nothing is trimmed to fit: past Slack's fifty blocks the rest
+  // follows as a second message. On 14 September the trimming would have hidden 11 of one
+  // person's 29 tasks — four to a twelve-row cap, seven to the block ceiling.
+  return paginate({
+    text: totalItems === 0 ? `Your stand-up — ${today}` : `${totalItems} items need your attention — ${today}`,
+    blocks: assembleWithBudget(intro, sections, Number.POSITIVE_INFINITY),
+  });
 }
 
 /** One task, numbered so it can be referred to out loud in stand-up. */
@@ -240,6 +250,45 @@ function taskRow(
   ];
 }
 
+/** Slack refuses a section whose text passes 3,000 characters — and with it the whole message. */
+const SECTION_MAX = 3000;
+
+/**
+ * A summary as one or more sections, each inside Slack's limit, split only between its
+ * lines so no link is ever cut in half.
+ *
+ * One section used to carry the whole summary. A week of activity measured 3,720
+ * characters in it, and Slack rejected the entire weekly message for that one block —
+ * the recipient got nothing (11 September). A three-day Monday stand-up grows the same way.
+ */
+export function summarySections(summary: string, heading = ''): Record<string, unknown>[] {
+  const lines = (heading ? `${heading}\n${summary}` : summary).split('\n').map(fitLine);
+  const out: Record<string, unknown>[] = [];
+  let current = '';
+  for (const line of lines) {
+    const joined = current ? `${current}\n${line}` : line;
+    if (joined.length > SECTION_MAX && current) {
+      out.push({ type: 'section', text: { type: 'mrkdwn', text: current } });
+      current = line;
+    } else {
+      current = joined;
+    }
+  }
+  if (current) out.push({ type: 'section', text: { type: 'mrkdwn', text: current } });
+  return out;
+}
+
+/**
+ * A single line too long for any section is cut at the last "; " between its items, so
+ * the cut falls between two links rather than through one. String length counts emoji as
+ * two, which only ever makes this stricter than Slack's own count.
+ */
+function fitLine(line: string): string {
+  if (line.length <= SECTION_MAX) return line;
+  const cut = line.lastIndexOf('; ', SECTION_MAX - 2);
+  return `${line.slice(0, cut > 0 ? cut : SECTION_MAX - 1)}…`;
+}
+
 /** Slack header blocks are plain text only, capped at 150 characters. */
 export function sectionHeading(text: string): unknown {
   return { type: 'header', text: { type: 'plain_text', text: text.slice(0, 150), emoji: true } };
@@ -284,11 +333,7 @@ export function slackRow(m: SlackMention, recipientId: string): unknown[] {
 }
 
 export function renderSlackRows(mentions: SlackMention[], recipientId: string): unknown[] {
-  const rows = mentions.slice(0, MAX_SLACK_ROWS).flatMap((m) => slackRow(m, recipientId));
-  if (mentions.length > MAX_SLACK_ROWS) {
-    rows.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${mentions.length - MAX_SLACK_ROWS} more_` }] });
-  }
-  return rows;
+  return mentions.flatMap((m) => slackRow(m, recipientId));
 }
 
 /** "Overdue by 49 days (due 16 Jul 2026)" -> "49 days overdue" */

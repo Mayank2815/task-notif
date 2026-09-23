@@ -1,7 +1,16 @@
-import type { Digest } from '../digest.js';
+import { hoursAndMinutes, type Digest } from '../digest.js';
 import { cleanTaskName } from '../teamwork/identity.js';
 
 const NAME_MAX = 58; // long enough to recognise a ticket, short enough to keep a line scannable
+
+/**
+ * Scrum and standing-meeting tasks collect time every day, but they are not work anyone
+ * reads out at stand-up. Seen in this workspace: "AD: Daily scrum, coordination, planning
+ * and weekly status calls", "Meetings, discussions and scrum", "Reusable Automation
+ * Services Daily Scrum". Kept out of "Worked on" — not out of the digest's time record.
+ */
+const SCRUM = /\bscrum\b/i;
+export const isStandupWork = (t: { taskName: string }): boolean => !SCRUM.test(t.taskName);
 
 /**
  * The stand-up summary, assembled from the digest's own facts.
@@ -16,13 +25,29 @@ export function buildFactualSummary(digest: Digest, slackConnected = true): stri
   const lines: string[] = [];
 
   // Several comments on one task is still one task; the summary counts work, not chatter.
-  const worked = uniqueByTask(digest.updates);
+  // Worked on = commented on OR logged time on. Time alone is often the only trace: an
+  // afternoon of code leaves no comment. Most time first, so the biggest piece of work
+  // is the one read out first; a task commented on without logged time follows.
+  const time = (digest.timeLogged ?? []).filter(isStandupWork);
+  const minutesOn = new Map(time.map((t) => [t.taskId, t.minutes]));
+  const commented = uniqueByTask(digest.updates).filter(isStandupWork);
+  const worked = [
+    ...commented,
+    ...time.filter((t) => !commented.some((c) => c.taskId === t.taskId)),
+  ].sort((a, b) => (minutesOn.get(b.taskId) ?? 0) - (minutesOn.get(a.taskId) ?? 0));
+  const totalMinutes = time.reduce((n, t) => n + t.minutes, 0);
+  const withTime = (t: { taskId: number; taskName: string; taskLink?: string; link: string; stage: string | null }) =>
+    `${taskWithStage(t)}${minutesOn.get(t.taskId) ? ` · ${hoursAndMinutes(minutesOn.get(t.taskId)!)}` : ''}`;
   const done = uniqueByTask(digest.updates.filter((u) => u.isDone));
   const blocked = uniqueByTask(digest.updates.filter((u) => u.isBlocker));
   const prs = digest.updates.flatMap((u) => u.prLinks.map((url) => ({ url, from: u })));
 
   if (worked.length > 0) {
-    lines.push(`*Worked on ${count(worked.length, 'task')}* — ${worked.slice(0, 4).map(taskWithStage).join('; ')}${more(worked.length, 4)}`);
+    const logged = totalMinutes > 0 ? ` · ${hoursAndMinutes(totalMinutes)} logged` : '';
+    // Every task, one to a line. Stand-up goes through each of them, so "+4 more" hid
+    // exactly the work that had to be read out. Sections split between lines, so a long
+    // list is carried across several blocks rather than cut.
+    lines.push([`*Worked on ${count(worked.length, 'task')}*${logged}`, ...worked.map((t) => `      ◦ ${withTime(t)}`)].join('\n'));
   }
 
   if (done.length > 0) {
@@ -65,17 +90,24 @@ export function buildFactualSummary(digest: Digest, slackConnected = true): stri
     lines.push(`*Talked in* — ${top.join('; ')}${more(digest.slackActivity.length, 4)}`);
   }
 
+  // One entry per task or conversation, not per comment. Two unanswered comments on one
+  // task read out as the same task twice (14 September: one reviewer commented twice on
+  // the same task and it was listed twice), and two replies in one channel likewise.
   const answered = [
-    ...digest.mentionsAnswered.map((m) => `${esc(m.author)} on ${link(m.link, trim(m.taskName))}`),
-    ...digest.slackReplied.map((m) => `${esc(m.author)} in ${link(m.permalink, m.isDm ? 'DM' : `#${m.channelName}`)}`),
+    ...grouped(digest.mentionsAnswered, (m) => `tw:${m.taskId ?? m.link}`,
+      (m, authors) => `${authors} on ${link(m.link, trim(m.taskName))}`),
+    ...grouped(digest.slackReplied, (m) => slackKey(m),
+      (m, authors) => `${authors} in ${link(m.permalink, m.isDm ? 'DM' : `#${m.channelName}`)}`),
   ];
   if (answered.length > 0) {
     lines.push(`*Answered ${answered.length}* — ${answered.slice(0, 5).join('; ')}${more(answered.length, 5)}`);
   }
 
   const open = [
-    ...digest.mentionsOpen.map((m) => `${link(m.link, trim(m.taskName))} (${esc(m.author)})`),
-    ...digest.slackAwaiting.map((m) => `${link(m.permalink, m.isDm ? `DM from ${m.author}` : `#${m.channelName}`)} (${esc(m.author)})`),
+    ...grouped(digest.mentionsOpen, (m) => `tw:${m.taskId ?? m.link}`,
+      (m, authors) => `${link(m.link, trim(m.taskName))} (${authors})`),
+    ...grouped(digest.slackAwaiting, (m) => slackKey(m),
+      (m, authors) => `${link(m.permalink, m.isDm ? `DM from ${m.author}` : `#${m.channelName}`)} (${authors})`),
   ];
 
   if (lines.length === 0 && open.length === 0) return null;
@@ -107,6 +139,28 @@ function taskWithStage(t: { taskName: string; taskLink?: string; link: string; s
 function uniqueByTask<T extends { taskId: number }>(items: T[]): T[] {
   const seen = new Set<number>();
   return items.filter((i) => (seen.has(i.taskId) ? false : (seen.add(i.taskId), true)));
+}
+
+/**
+ * One entry per key, in first-seen order, carrying every distinct author for it — so
+ * merging two comments never drops the name of someone who asked.
+ */
+function grouped<T extends { author: string }>(
+  items: T[], key: (item: T) => string, render: (first: T, authors: string) => string,
+): string[] {
+  const byKey = new Map<string, { first: T; authors: string[] }>();
+  for (const item of items) {
+    const k = key(item);
+    const entry = byKey.get(k) ?? { first: item, authors: [] };
+    if (!entry.authors.includes(item.author)) entry.authors.push(item.author);
+    byKey.set(k, entry);
+  }
+  return [...byKey.values()].map((e) => render(e.first, e.authors.map(esc).join(', ')));
+}
+
+/** A DM is one conversation per person; a channel is one conversation however many threads. */
+function slackKey(m: { isDm: boolean; author: string; channelName: string }): string {
+  return m.isDm ? `dm:${m.author}` : `ch:${m.channelName}`;
 }
 
 function more(total: number, shown: number): string {

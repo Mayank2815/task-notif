@@ -55,7 +55,9 @@ export interface ReportPerson {
   recipientId: string;
   label: string;
   completed: { taskId: number; taskName: string; project: string | null; link: string; at: string }[];
-  workedOn: { taskId: number; taskName: string; project: string | null; link: string }[];
+  workedOn: { taskId: number; taskName: string; project: string | null; link: string; minutes: number }[];
+  /** Everything logged in the range, in minutes. */
+  totalMinutes: number;
   comments: number;
   statusChanges: number;
   newlyAssigned: { taskId: number; taskName: string; project: string | null; link: string }[];
